@@ -6,7 +6,8 @@
 
 ![Python](https://img.shields.io/badge/Python-3.11+-blue?logo=python&logoColor=white)
 ![Platform](https://img.shields.io/badge/Platform-Apple%20Silicon-black?logo=apple)
-![Tests](https://img.shields.io/badge/Tests-81%20passing-brightgreen)
+![Tests](https://img.shields.io/badge/Tests-77%20passing-brightgreen)
+![License](https://img.shields.io/badge/License-MIT-blue)
 ![Stack](https://img.shields.io/badge/Stack-MLX%20%7C%20NEON%20%7C%20C%2B%2B17-orange)
 
 ---
@@ -110,8 +111,11 @@ pip install -e ".[dev]"
 # Build NEON kernel (macOS, requires clang++)
 bash siliconfer/kernels/neon/build_kernel.sh
 
-# Tests (81 tests, ~7s)
+# Tests — 77 fast unit + integration tests (~7s, no model needed)
 pytest tests/
+
+# Full suite including logit-parity vs HuggingFace (requires Qwen2.5-0.5B in cache)
+pytest tests/ --run-integration
 
 # Interactive generation
 python scripts/run.py \

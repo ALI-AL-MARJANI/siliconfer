@@ -1,5 +1,8 @@
 """Phase 1 logit parity test: our engine vs HuggingFace reference."""
 
+import pytest
+pytestmark = pytest.mark.integration
+
 import numpy as np
 import mlx.core as mx
 import torch

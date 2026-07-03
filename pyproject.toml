@@ -2,6 +2,9 @@
 name = "siliconfer"
 version = "0.1.0"
 description = "From-scratch 4-bit LLM inference engine for Apple Silicon"
+readme = "README.md"
+license = { text = "MIT" }
+authors = [{ name = "Ali Al-Marjani", email = "aliamrjani@gmail.com" }]
 requires-python = ">=3.11"
 dependencies = [
     "mlx>=0.22.0",
@@ -20,6 +23,9 @@ dev = [
     "pybind11>=2.13",
 ]
 
+[project.urls]
+Homepage = "https://github.com/ALI-AL-MARJANI/siliconfer"
+
 [build-system]
 requires = ["setuptools>=70"]
 build-backend = "setuptools.build_meta"
@@ -29,3 +35,6 @@ include = ["siliconfer*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = [
+    "integration: requires a downloaded model — pass --run-integration to enable",
+]
