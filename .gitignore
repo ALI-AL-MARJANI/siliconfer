@@ -1,0 +1,35 @@
+# ── Internal project documents ─────────────────────────────────────────────
+CLAUDE.md
+NOTES.md
+ROADMAP.md
+
+# ── Python ─────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+
+# ── Compiled kernel (.so / .dylib) ─────────────────────────────────────────
+*.so
+*.dylib
+
+# ── CMake build artefacts ──────────────────────────────────────────────────
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+Makefile
+build/
+
+# ── Generated benchmark outputs ────────────────────────────────────────────
+results/
+
+# ── macOS ──────────────────────────────────────────────────────────────────
+.DS_Store
+
+# ── Editor / IDE ───────────────────────────────────────────────────────────
+.idea/
+.vscode/
+*.swp
