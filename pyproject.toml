@@ -1,0 +1,31 @@
+[project]
+name = "siliconfer"
+version = "0.1.0"
+description = "From-scratch 4-bit LLM inference engine for Apple Silicon"
+requires-python = ">=3.11"
+dependencies = [
+    "mlx>=0.22.0",
+    "numpy>=1.26",
+    "safetensors>=0.4",
+    "tokenizers>=0.20",
+    "transformers>=4.45",
+    "datasets>=3.0",
+    "torch>=2.4",
+    "matplotlib>=3.9",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pybind11>=2.13",
+]
+
+[build-system]
+requires = ["setuptools>=70"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["siliconfer*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

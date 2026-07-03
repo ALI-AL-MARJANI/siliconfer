@@ -1,0 +1,160 @@
+"""Phase 6: Load a pretrained model and replace all attn/MLP linears with Q4Linear.
+
+Usage:
+    from siliconfer.engine.q4_loader import load_q4_model
+    model, config = load_q4_model(model_dir, method="rtn")
+
+Supported methods: "rtn", "gptq", "awq".
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+import numpy as np
+import mlx.core as mx
+
+from siliconfer.model.llama import LlamaModel
+from siliconfer.model.config import ModelConfig
+from siliconfer.model.q4_linear import Q4Linear
+from siliconfer.kernels.neon import pack_weights_sym
+
+
+def _pack_and_replace_linears(
+    model: LlamaModel,
+    group_size: int = 128,
+    skip_layers: set[int] | None = None,
+) -> None:
+    """Replace every attn+MLP nn.Linear in the model with Q4Linear, in-place.
+
+    Reads the current .weight (which may be fake-quant after RTN/GPTQ/AWQ) and
+    re-packs it into uint8 + float32 scales. The round-trip is lossless: fake-quant
+    weights are already on the int4 grid, so re-quantizing recovers the same values.
+
+    Args:
+        skip_layers: set of layer indices to leave in fp16 (mixed precision). E.g.,
+            {0, n_layers-1} keeps the first and last layers in fp16 for lower PPL.
+    """
+    for i, layer in enumerate(model.layers):
+        if skip_layers and i in skip_layers:
+            continue
+        attn = layer.self_attn
+        mlp = layer.mlp
+
+        proj_pairs = [
+            (attn, "q_proj"),
+            (attn, "k_proj"),
+            (attn, "v_proj"),
+            (attn, "o_proj"),
+            (mlp,  "gate_proj"),
+            (mlp,  "up_proj"),
+            (mlp,  "down_proj"),
+        ]
+
+        for parent, name in proj_pairs:
+            lin = getattr(parent, name)
+            in_f = lin.weight.shape[1]
+
+            if in_f < group_size:
+                # Too small to quantize (synthetic / tiny test models)
+                continue
+
+            W_np = np.array(lin.weight.astype(mx.float32))
+            packed, scales = pack_weights_sym(W_np, group_size=group_size)
+            bias = getattr(lin, "bias", None)
+
+            setattr(parent, name, Q4Linear(packed, scales, bias=bias, group_size=group_size))
+
+
+def load_q4_model(
+    model_dir: str | Path,
+    method: str = "rtn",
+    group_size: int = 128,
+    sym: bool = True,
+    calib_model_id: str | None = None,
+    n_calib_seqs: int = 128,
+    calib_len: int = 512,
+    skip_layers: set[int] | None = None,
+    verbose: bool = True,
+) -> tuple[LlamaModel, ModelConfig]:
+    """Load a model from disk, quantize to int4, and return a kernel-backed model.
+
+    Args:
+        model_dir:      Path to HF model directory (safetensors + config.json).
+        method:         "rtn" | "gptq" | "awq" — quantization algorithm.
+        group_size:     int4 group size (64 or 128).
+        sym:            Symmetric quantization (True) or asymmetric (False).
+        calib_model_id: HF model ID for calibration tokenizer (GPTQ/AWQ only).
+                        Defaults to the basename of model_dir.
+        n_calib_seqs:   Number of WikiText-2 calibration sequences (GPTQ/AWQ).
+        calib_len:      Sequence length per calibration sequence.
+        skip_layers:    Optional set of layer indices to keep in fp16 (mixed precision).
+                        E.g., skip_layers={0, 23} keeps first and last layers in fp16.
+        verbose:        Print progress messages.
+
+    Returns:
+        (model, config) — LlamaModel with all linear layers replaced by Q4Linear.
+    """
+    model_dir = Path(model_dir)
+
+    if verbose:
+        print(f"[q4_loader] Loading fp16 model from {model_dir} ...")
+    model, config = LlamaModel.from_pretrained(model_dir, dtype=mx.float16)
+    mx.eval(model.parameters())
+
+    if method == "rtn":
+        if verbose:
+            print(f"[q4_loader] Applying RTN-int4 (group_size={group_size}, sym={sym}) ...")
+        from siliconfer.quant.rtn import apply_rtn
+        apply_rtn(model, group_size=group_size, sym=sym)
+        mx.eval(model.parameters())
+
+    elif method in ("gptq", "awq"):
+        mid = calib_model_id or model_dir.name
+        if verbose:
+            print(f"[q4_loader] Loading {n_calib_seqs} calibration sequences "
+                  f"(model_id={mid}) ...")
+        from siliconfer.quant.calibration import load_calibration_sequences
+        calib_seqs = load_calibration_sequences(mid, n_seqs=n_calib_seqs, seq_len=calib_len)
+
+        if method == "gptq":
+            if verbose:
+                print(f"[q4_loader] Applying GPTQ-int4 ...")
+            from siliconfer.quant.gptq import apply_gptq
+            apply_gptq(model, calib_seqs, group_size=group_size, sym=sym, verbose=verbose)
+        else:
+            if verbose:
+                print(f"[q4_loader] Applying AWQ-int4 ...")
+            from siliconfer.quant.awq import apply_awq
+            apply_awq(model, calib_seqs, group_size=group_size, sym=sym,
+                      fold_scales=False, verbose=verbose)
+        mx.eval(model.parameters())
+
+    else:
+        raise ValueError(f"Unknown method {method!r}. Choose 'rtn', 'gptq', or 'awq'.")
+
+    if verbose:
+        print("[q4_loader] Packing int4 weights and replacing linear layers ...")
+    _pack_and_replace_linears(model, group_size=group_size, skip_layers=skip_layers)
+
+    if verbose:
+        _report_memory(model)
+
+    return model, config
+
+
+def _report_memory(model: LlamaModel) -> None:
+    """Print approximate packed weight memory for the model."""
+    total_bytes = 0
+    n_q4 = 0
+    for layer in model.layers:
+        for parent in (layer.self_attn, layer.mlp):
+            for name in ("q_proj", "k_proj", "v_proj", "o_proj",
+                         "gate_proj", "up_proj", "down_proj"):
+                lin = getattr(parent, name, None)
+                if isinstance(lin, Q4Linear):
+                    # packed weights + scales
+                    total_bytes += lin._packed.nbytes + lin._scales.nbytes
+                    n_q4 += 1
+    print(f"[q4_loader] Replaced {n_q4} linear layers with Q4Linear. "
+          f"Packed weight footprint: {total_bytes / 1e6:.1f} MB")
