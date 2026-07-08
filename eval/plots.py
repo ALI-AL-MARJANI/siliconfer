@@ -22,12 +22,16 @@ COLORS = {
     "rtn":   "#DD8452",
     "gptq":  "#55A868",
     "awq":   "#C44E52",
+    "hqq":   "#8172B2",
+    "sinq":  "#937860",
 }
 METHOD_LABELS = {
     "fp16":  "fp16 (MLX)",
     "rtn":   "RTN-int4",
     "gptq":  "GPTQ-int4",
     "awq":   "AWQ-int4",
+    "hqq":   "HQQ-int4",
+    "sinq":  "SINQ-int4",
 }
 
 

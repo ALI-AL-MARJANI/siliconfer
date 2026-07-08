@@ -14,7 +14,9 @@ from siliconfer.kernels.neon import (
     pack_weights_asym,
     gemv_sym,
     gemv_scalar,
+    gemv_asym,
     gemm_sym,
+    gemm_asym,
 )
 from siliconfer.quant.primitives import fake_quantize, quantize_sym, dequantize_sym
 
@@ -147,6 +149,65 @@ def test_gemm_sym_matches_gemv_loop(T):
 
     assert Y_gemm.shape == (T, out_f)
     np.testing.assert_allclose(Y_gemm, Y_ref, atol=1e-5)
+
+
+# ---------------------------------------------------------------------------
+# GEMM correctness, asymmetric (Phase 9-follow-up: closes the gap documented
+# in CLAUDE.md §9 — Q4Linear previously had no way to run prefill on
+# asymmetrically-quantized weights at all, silently corrupting HQQ's output
+# by re-packing it symmetric).
+# ---------------------------------------------------------------------------
+
+def _ref_gemv_asym(W_fp32: np.ndarray, x: np.ndarray, group_size: int) -> np.ndarray:
+    """Reference: asymmetric fake-quantize W then compute W_q @ x in float32."""
+    W_q = fake_quantize(W_fp32, group_size=group_size, sym=False).astype(np.float32)
+    return (W_q @ x.astype(np.float32)).astype(np.float32)
+
+
+@pytest.mark.parametrize("group_size", [64, 128])
+def test_gemv_asym_matches_reference(group_size):
+    rng = np.random.default_rng(42)
+    out_f, in_f = 128, 256
+    W = rng.normal(0, 1, (out_f, in_f)).astype(np.float32)
+    x = rng.normal(0, 1, in_f).astype(np.float32)
+
+    packed, scales, zeros = pack_weights_asym(W, group_size=group_size)
+    y_kernel = gemv_asym(packed, scales, zeros, x, group_size)
+    y_ref = _ref_gemv_asym(W, x, group_size)
+
+    np.testing.assert_allclose(y_kernel, y_ref, atol=1e-3, rtol=1e-3)
+
+
+@pytest.mark.parametrize("T", [1, 4, 32])
+def test_gemm_asym_matches_gemv_asym_loop(T):
+    """GEMM (asymmetric) output should equal T independent GEMV(asym) calls."""
+    rng = np.random.default_rng(99)
+    out_f, in_f = 64, 128
+    W = rng.normal(0, 1, (out_f, in_f)).astype(np.float32)
+    X = rng.normal(0, 1, (T, in_f)).astype(np.float32)
+
+    packed, scales, zeros = pack_weights_asym(W)
+    Y_gemm = gemm_asym(packed, scales, zeros, X)
+
+    Y_ref = np.stack([gemv_asym(packed, scales, zeros, X[t]) for t in range(T)])
+
+    assert Y_gemm.shape == (T, out_f)
+    np.testing.assert_allclose(Y_gemm, Y_ref, atol=1e-5)
+
+
+def test_gemm_asym_matches_reference_matmul():
+    rng = np.random.default_rng(3)
+    out_f, in_f, T = 32, 128, 8
+    W = rng.normal(0, 1, (out_f, in_f)).astype(np.float32)
+    X = rng.normal(0, 1, (T, in_f)).astype(np.float32)
+
+    packed, scales, zeros = pack_weights_asym(W, group_size=128)
+    Y_kernel = gemm_asym(packed, scales, zeros, X, group_size=128)
+
+    W_q = fake_quantize(W, group_size=128, sym=False).astype(np.float32)
+    Y_ref = X @ W_q.T
+
+    np.testing.assert_allclose(Y_kernel, Y_ref, atol=1e-3, rtol=1e-3)
 
 
 # ---------------------------------------------------------------------------

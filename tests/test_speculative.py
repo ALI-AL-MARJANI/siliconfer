@@ -222,3 +222,195 @@ class TestSpeculativeDecoding:
         assert len(res.token_ids) == 8
         vocab = _TINY_CFG["vocab_size"]
         assert all(0 <= t < vocab for t in res.token_ids)
+
+
+# ---------------------------------------------------------------------------
+# Phase 9d research note: naive multi-candidate retry is provably NOT lossless
+# ---------------------------------------------------------------------------
+#
+# Documents (and tests, so it can't silently regress into being "fixed" and
+# reintroduced without noticing the flaw) a rejected design: after a drafted
+# token is rejected, resample fresh i.i.d. candidates from p_draft and retry
+# the same accept/reject test before falling back to residual sampling. The
+# relative win-probabilities among candidates don't depend on the retry
+# count (provable), but the residual/fallback distribution required to keep
+# the *overall* marginal equal to p_target does — and for retry count >= 2 it
+# can require a NEGATIVE probability for some tokens, which is impossible.
+# This is exactly why real tree-attention speculative decoding (SpecInfer,
+# EAGLE-2) needs careful correlated multi-candidate verification instead.
+
+def test_naive_multicandidate_retry_requires_negative_fallback_probability():
+    """Algebraic proof that naive independent-retry is not a valid scheme:
+    for retry count M=2, the fallback distribution required to keep the
+    overall marginal equal to p_target has a negative entry whenever
+    p_draft(v) >= p_target(v) for some v (with Z small enough)."""
+    rng = np.random.default_rng(0)
+    vocab = 10
+    p_draft = rng.dirichlet(np.ones(vocab) * 2.0)
+    p_target = rng.dirichlet(np.ones(vocab) * 2.0)
+
+    q = np.minimum(p_draft, p_target)
+    Z = q.sum()
+    M = 2
+    required_fallback_numerator = p_target - q * (1 - (1 - Z) ** M) / Z
+
+    assert required_fallback_numerator.min() < 0.0, (
+        "expected the naive scheme's required fallback distribution to be "
+        "invalid (negative) for M=2 retries — if this now passes, the "
+        "surrounding claim in speculative.py's Phase 9d research note needs "
+        "re-examination, not silent removal"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Phase 9d: dynamic speculation depth (the feature actually shipped)
+# ---------------------------------------------------------------------------
+
+class TestDynamicK:
+    def test_greedy_still_matches_non_speculative(self):
+        """dynamic_K must not change greedy-mode losslessness — K never
+        appears in the accept/reject correctness proof, so varying it
+        round-to-round is losslessness-neutral by construction."""
+        model = _make_tiny_model(seed=7)
+        params = SamplingParams(temperature=0.0, max_tokens=12)
+        prompt = _prompt(6)
+
+        spec_res = speculative_generate(
+            draft=model, target=model, prompt_ids=prompt,
+            params=params, K=2, seed=0, dynamic_K=True, K_min=1, K_max=6,
+        )
+        base_res = generate(model, prompt, params=params)
+
+        assert spec_res.token_ids == base_res.token_ids
+
+    def test_same_model_greedy_full_acceptance_with_dynamic_k(self):
+        """With draft=target and greedy sampling, acceptance rate is still 1.0
+        regardless of how K adapts round to round."""
+        model = _make_tiny_model(seed=0)
+        params = SamplingParams(temperature=0.0, max_tokens=16)
+        res = speculative_generate(
+            draft=model, target=model, prompt_ids=_prompt(),
+            params=params, K=2, seed=42, dynamic_K=True, K_min=1, K_max=8,
+        )
+        assert res.acceptance_rate == pytest.approx(1.0, abs=0.01)
+
+    def test_k_grows_when_fully_accepted(self):
+        """With draft=target (guaranteed full acceptance under greedy), K
+        should grow every round up to K_max and stay there."""
+        model = _make_tiny_model(seed=0)
+        params = SamplingParams(temperature=0.0, max_tokens=30)
+        res = speculative_generate(
+            draft=model, target=model, prompt_ids=_prompt(),
+            params=params, K=1, seed=42, dynamic_K=True, K_min=1, K_max=5,
+        )
+        # total_draft_tokens should reflect K growing 1->2->3->4->5->5->...,
+        # not staying flat at 1 the whole time (which is what dynamic_K=False
+        # would give for the same number of rounds).
+        avg_k = res.total_draft_tokens / res.total_rounds
+        assert avg_k > 1.5, f"expected K to have grown from 1, got avg_k={avg_k}"
+
+    def test_k_shrinks_on_rejection(self):
+        """With genuinely different draft/target models and stochastic
+        sampling (rejections expected — greedy argmax coincidentally agrees
+        too often between these tiny synthetic models to exercise this path),
+        K should be pulled back toward K_min after a round that rejects early."""
+        draft_model = _make_tiny_model(seed=11)
+        target_model = _make_tiny_model(seed=99)
+        params = SamplingParams(temperature=0.8, max_tokens=40)
+        res = speculative_generate(
+            draft=draft_model, target=target_model, prompt_ids=_prompt(),
+            params=params, K=6, seed=42, dynamic_K=True, K_min=1, K_max=6,
+        )
+        # Different models should reject sometimes — K shouldn't stay pinned
+        # at the max the whole time the way the same-model case does.
+        avg_k = res.total_draft_tokens / res.total_rounds
+        assert avg_k < 6.0, f"expected K to shrink below K_max at some point, got avg_k={avg_k}"
+
+    def test_runs_end_to_end_with_different_draft_and_target(self):
+        """Smoke test: genuinely different draft/target models, temperature>0,
+        dynamic_K enabled — the realistic scenario this feature targets."""
+        draft_model = _make_tiny_model(seed=11)
+        target_model = _make_tiny_model(seed=22)
+        params = SamplingParams(temperature=0.8, max_tokens=10)
+
+        res = speculative_generate(
+            draft=draft_model, target=target_model, prompt_ids=_prompt(),
+            params=params, K=3, seed=5, dynamic_K=True, K_min=1, K_max=6,
+        )
+        assert len(res.token_ids) == 10
+        vocab = _TINY_CFG["vocab_size"]
+        assert all(0 <= t < vocab for t in res.token_ids)
+
+    def test_respects_k_bounds(self):
+        """K should never leave [K_min, K_max] regardless of round outcomes."""
+        draft_model = _make_tiny_model(seed=3)
+        target_model = _make_tiny_model(seed=44)
+        params = SamplingParams(temperature=0.5, max_tokens=25)
+        # K_min == K_max degenerates to fixed-K — should still just work.
+        res = speculative_generate(
+            draft=draft_model, target=target_model, prompt_ids=_prompt(),
+            params=params, K=3, seed=1, dynamic_K=True, K_min=3, K_max=3,
+        )
+        assert res.total_draft_tokens == res.total_rounds * 3
+
+
+# ---------------------------------------------------------------------------
+# quantize_kv_cache integration (extends Phase 9b's QuantizedKVCache, which
+# Attention.__call__/_trim_cache already handled transparently, into the
+# speculative decoding loop)
+# ---------------------------------------------------------------------------
+
+class TestQuantizedKVCacheSpeculative:
+    def test_greedy_matches_non_speculative_quantized_cache_generation(self):
+        """With quantize_kv_cache=True, speculative decoding must exactly
+        match *non-speculative generation from the same quantized-cache
+        model* — not the fp16-cache model's output, since quantized-cache
+        decoding is itself only an approximation of fp16 (Phase 9b)."""
+        model = _make_tiny_model(seed=7)
+        params = SamplingParams(temperature=0.0, max_tokens=10)
+        prompt = _prompt(6)
+
+        spec_res = speculative_generate(
+            draft=model, target=model, prompt_ids=prompt,
+            params=params, K=3, seed=0, quantize_kv_cache=True,
+        )
+        base_res = generate(model, prompt, params=params, quantize_kv_cache=True)
+
+        assert spec_res.token_ids == base_res.token_ids
+
+    def test_same_model_greedy_full_acceptance_with_quantized_cache(self):
+        model = _make_tiny_model(seed=0)
+        params = SamplingParams(temperature=0.0, max_tokens=12)
+        res = speculative_generate(
+            draft=model, target=model, prompt_ids=_prompt(),
+            params=params, K=3, seed=42, quantize_kv_cache=True,
+        )
+        assert res.acceptance_rate == pytest.approx(1.0, abs=0.01)
+
+    def test_combined_with_dynamic_k(self):
+        """quantize_kv_cache and dynamic_K are independent knobs — should
+        compose without issue."""
+        model = _make_tiny_model(seed=2)
+        params = SamplingParams(temperature=0.0, max_tokens=14)
+        res = speculative_generate(
+            draft=model, target=model, prompt_ids=_prompt(),
+            params=params, K=2, seed=42,
+            quantize_kv_cache=True, dynamic_K=True, K_min=1, K_max=6,
+        )
+        assert len(res.token_ids) == 14
+        assert res.acceptance_rate == pytest.approx(1.0, abs=0.01)
+
+    def test_runs_end_to_end_with_different_draft_and_target(self):
+        """Smoke test: genuinely different draft/target models, temperature>0,
+        quantize_kv_cache=True — the realistic scenario this feature targets."""
+        draft_model = _make_tiny_model(seed=11)
+        target_model = _make_tiny_model(seed=22)
+        params = SamplingParams(temperature=0.8, max_tokens=10)
+
+        res = speculative_generate(
+            draft=draft_model, target=target_model, prompt_ids=_prompt(),
+            params=params, K=3, seed=5, quantize_kv_cache=True,
+        )
+        assert len(res.token_ids) == 10
+        vocab = _TINY_CFG["vocab_size"]
+        assert all(0 <= t < vocab for t in res.token_ids)

@@ -104,9 +104,49 @@ def measure_memory(model: LlamaModel) -> dict[str, float]:
                 lin = getattr(parent, name, None)
                 if isinstance(lin, Q4Linear):
                     q4_bytes += lin._packed.nbytes + lin._scales.nbytes
+                    if lin._zeros is not None:
+                        q4_bytes += lin._zeros.nbytes
 
     return {
         "mlx_param_mb": mlx_bytes / 1e6,
         "q4_packed_mb": q4_bytes / 1e6,
         "total_mb":     (mlx_bytes + q4_bytes) / 1e6,
+    }
+
+
+# ---------------------------------------------------------------------------
+# KV-cache memory (Phase 9b)
+# ---------------------------------------------------------------------------
+
+def measure_kv_cache_memory(config, seq_len: int, batch: int = 1) -> dict[str, float]:
+    """Analytical KV-cache memory footprint at a given context length.
+
+    No generation is run — this is a closed-form size calculation (mirrors
+    how weight-quantization group overhead is accounted for in NOTES.md),
+    since the cache's byte count is a deterministic function of the config
+    and sequence length, not something that needs to be measured empirically.
+
+    Args:
+        config: ModelConfig (needs num_hidden_layers, num_key_value_heads, head_dim).
+        seq_len: number of cached KV positions.
+        batch: batch size.
+
+    Returns:
+        dict with keys: fp16_mb, int8_mb, compression.
+    """
+    n_layers = config.num_hidden_layers
+    n_kv_heads = config.num_key_value_heads
+    head_dim = config.head_dim
+
+    n_values = 2 * n_layers * batch * n_kv_heads * seq_len * head_dim   # k + v
+
+    fp16_bytes = n_values * 2
+    # int8: 1 byte/value + one float32 scale per (batch, head, token) vector
+    n_vectors = 2 * n_layers * batch * n_kv_heads * seq_len
+    int8_bytes = n_values * 1 + n_vectors * 4
+
+    return {
+        "fp16_mb": fp16_bytes / 1e6,
+        "int8_mb": int8_bytes / 1e6,
+        "compression": fp16_bytes / int8_bytes,
     }

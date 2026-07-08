@@ -15,7 +15,7 @@ from siliconfer.model.llama import LlamaModel
 from siliconfer.model.q4_linear import Q4Linear
 from siliconfer.engine.q4_loader import _pack_and_replace_linears
 from siliconfer.engine.generate import generate, SamplingParams
-from siliconfer.kernels.neon import pack_weights_sym, gemv_sym
+from siliconfer.kernels.neon import pack_weights_sym, pack_weights_asym, gemv_sym
 from siliconfer.quant.primitives import fake_quantize
 
 
@@ -127,6 +127,66 @@ def test_q4linear_batch_and_seq():
 
     y = layer(mx.array(x_np))
     assert y.shape == (2, 5, out_f)
+
+
+def test_q4linear_asym_matches_fake_quant():
+    """Asymmetric Q4Linear (zeros != None) should match asymmetric fake_quantize
+    exactly the way the symmetric path already does — closes the gap documented
+    in CLAUDE.md §9 (Q4Linear had no zero-point storage at all before this)."""
+    rng = np.random.default_rng(4)
+    out_f, in_f = 32, 64
+    W = (rng.normal(0, 1, (out_f, in_f)) + 1.0).astype(np.float32)   # skewed, favors asym
+    x_np = rng.normal(0, 1, (1, in_f)).astype(np.float32)
+
+    packed, scales, zeros = pack_weights_asym(W, group_size=64)
+    layer = Q4Linear(packed, scales, zeros=zeros, group_size=64)
+
+    y_q4 = np.array(layer(mx.array(x_np)))[0]
+
+    W_fq = fake_quantize(W, group_size=64, sym=False)
+    y_ref = W_fq @ x_np[0]
+
+    np.testing.assert_allclose(y_q4, y_ref, atol=1e-3, rtol=1e-3)
+
+
+def test_q4linear_asym_beats_sym_on_skewed_weights():
+    """Sanity check that asymmetric packing is actually being used, not
+    silently falling back to symmetric: on skewed weights, packing the SAME
+    weight both ways should give visibly different reconstructions."""
+    rng = np.random.default_rng(5)
+    out_f, in_f = 16, 64
+    W = (rng.normal(0, 1, (out_f, in_f)) + 2.0).astype(np.float32)
+    x_np = rng.normal(0, 1, (1, in_f)).astype(np.float32)
+
+    packed_a, scales_a, zeros_a = pack_weights_asym(W, group_size=64)
+    layer_asym = Q4Linear(packed_a, scales_a, zeros=zeros_a, group_size=64)
+
+    packed_s, scales_s = pack_weights_sym(W, group_size=64)
+    layer_sym = Q4Linear(packed_s, scales_s, group_size=64)
+
+    y_asym = np.array(layer_asym(mx.array(x_np)))
+    y_sym = np.array(layer_sym(mx.array(x_np)))
+
+    assert not np.allclose(y_asym, y_sym, atol=1e-3), \
+        "asymmetric and symmetric packing should diverge on skewed weights"
+
+
+def test_pack_and_replace_linears_asym_mode():
+    """_pack_and_replace_linears(pack_sym=False) should produce Q4Linear
+    instances with zeros set, and the model should still run correctly."""
+    model = _make_tiny_model(seed=6)
+    _pack_and_replace_linears(model, group_size=_GROUP_SIZE, pack_sym=False)
+
+    for layer in model.layers:
+        lin = layer.self_attn.q_proj
+        assert isinstance(lin, Q4Linear)
+        assert lin._zeros is not None, "pack_sym=False should store zero-points"
+
+    input_ids = mx.array([[1, 2, 3, 4]])
+    logits, cache = model(input_ids)
+    mx.eval(logits)
+    assert logits.shape == (1, 4, _TINY_CFG["vocab_size"])
+    assert np.isfinite(np.array(logits)).all()
 
 
 # ---------------------------------------------------------------------------
