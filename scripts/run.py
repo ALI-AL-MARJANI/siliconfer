@@ -42,7 +42,7 @@ from pathlib import Path
 import mlx.core as mx
 
 from siliconfer.engine.q4_loader import load_q4_model
-from siliconfer.engine.generate import generate, SamplingParams
+from siliconfer.engine.generate import generate, warmup, SamplingParams
 from siliconfer.engine.speculative import speculative_generate
 from siliconfer.kernels.neon import NEON_AVAILABLE
 from siliconfer.model.config import ModelConfig
@@ -111,6 +111,14 @@ def main() -> None:
     parser.add_argument("--skip_layers", default=None,
                         help="Comma-separated layer indices to keep in fp16, e.g. '0,23'. "
                              "Overrides --mixed_precision if both are given.")
+    parser.add_argument("--warmup", action="store_true",
+                        help="Run a throwaway forward pass before the timed generation to "
+                             "trigger MLX's lazy-graph compilation ahead of time. Measured "
+                             "effect: ~1.4x faster first token on the plain fp16 path, but "
+                             "negligible on the quantized Q4Linear path (it already forces "
+                             "eager per-layer eval to bridge to the NEON kernel, so there's "
+                             "little lazy graph left to warm) — see engine/generate.py's "
+                             "warmup() docstring.")
     args = parser.parse_args()
 
     mx.random.seed(args.seed)
@@ -155,6 +163,11 @@ def main() -> None:
     load_sec = time.perf_counter() - t0
     print(f"[run] Target model ready in {load_sec:.1f}s\n")
 
+    if args.warmup:
+        t0 = time.perf_counter()
+        warmup(model, quantize_kv_cache=args.quantize_kv_cache)
+        print(f"[run] Warmup done in {time.perf_counter()-t0:.2f}s\n")
+
     draft_model = None
     if args.speculative:
         draft_dir = _resolve_model_dir(args.draft_model_id, args.draft_model_dir) \
@@ -175,6 +188,11 @@ def main() -> None:
             verbose=True,
         )
         print(f"[run] Draft model ready in {time.perf_counter()-t0:.1f}s\n")
+
+        if args.warmup:
+            t0 = time.perf_counter()
+            warmup(draft_model, quantize_kv_cache=args.quantize_kv_cache)
+            print(f"[run] Draft warmup done in {time.perf_counter()-t0:.2f}s\n")
 
     # ------------------------------------------------------------------ tokenize
     tokenizer = _load_tokenizer(model_dir)

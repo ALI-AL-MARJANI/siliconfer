@@ -6,7 +6,7 @@
 
 ![Python](https://img.shields.io/badge/Python-3.11+-blue?logo=python&logoColor=white)
 ![Platform](https://img.shields.io/badge/Platform-Apple%20Silicon-black?logo=apple)
-![Tests](https://img.shields.io/badge/Tests-146%20passing-brightgreen)
+![Tests](https://img.shields.io/badge/Tests-193%20passing-brightgreen)
 ![License](https://img.shields.io/badge/License-MIT-blue)
 ![Stack](https://img.shields.io/badge/Stack-MLX%20%7C%20NEON%20%7C%20Metal%20%7C%20C%2B%2B17-orange)
 
@@ -140,6 +140,27 @@ crushed columns.
 
 All five methods use **group-wise int4** (group size 128): two nibbles per byte, one fp32 scale per group (+ zero-point for asymmetric methods).
 
+**Mixed 2/4-bit (and 3/4-bit) precision** (`quant/mixed_precision.py`,
+CoopQ-inspired) — a from-scratch permutation-sampling Shapley-value estimator
+(checked against closed-form ground truth for both additive and
+pairwise-interaction games, not just "does it run") ranks each transformer
+block's sensitivity, then demotes the least-sensitive blocks under a memory
+budget (an exact top-k selection here, since every block in this architecture
+has identical size). HQQ was generalized to run its outlier-aware clip-range
+search at any bit-width (`quantize_sym_n`/`quantize_asym_n` in
+`quant/primitives.py`), not just plain RTN, after a real-model check found
+plain RTN-int2 catastrophically lossy (PPL 500,000+ demoting the whole
+network) regardless of which blocks were chosen. Honest, scale-dependent
+result: **2-bit is never a good tradeoff** vs uniform HQQ-int4 at this model's
+size, even with the best selection + algorithm this session could produce
+(Shapley selection beats uniform demotion by ~437x, HQQ-int2 beats RTN-int2 by
+~30-2.5x, but the floor is still too low). **3-bit is a different, genuinely
+useful story**: demoting the same 5 (of 24) least-sensitive blocks to 3-bit
+instead of 2-bit cuts PPL degradation by ~2.6x (25.33 vs 65.65) for a smaller
+memory saving — a real, modest compression bonus on top of uniform int4. See
+NOTES.md §15-16 for the full numbers; not shipped as a served (packed-kernel)
+method yet — see § 3 below.
+
 ---
 
 ### 2 — ARM NEON kernel
@@ -185,6 +206,10 @@ Three iterations, all verified to float32 machine-epsilon precision against the 
 
 **Speculative decoding** (`engine/speculative.py`): a small draft model proposes K tokens; the target verifies K+1 in one forward pass. Rejection sampling (`accept with prob min(1, p_target/p_draft)`) is provably lossless — with draft=target and greedy decoding, output matches non-speculative exactly (verified by test). **Dynamic speculation depth** adapts K round-to-round (deeper after full acceptance, shallower after an early rejection) — exactly lossless by construction, since K never appears in the accept/reject correctness proof. A more ambitious multi-candidate retry scheme was attempted first and rejected: proved algebraically that it requires negative fallback probabilities for retry counts ≥ 2, i.e. it's provably *not* lossless — kept as a documented, tested negative finding rather than shipped.
 
+**EAGLE-3-inspired draft head** (`model/draft_head.py`, `engine/draft_training.py`) — a real, trained (not just architected) scaled-down version of EAGLE's actual design: multi-layer feature fusion from 3 target depths, one `TransformerBlock` at the target's own hidden width, and the target's own frozen embedding/LM head reused rather than trained from scratch (matching EAGLE's real architecture, not a simplification invented here). Trained via real supervised distillation on Qwen2.5-0.5B + WikiText-2 (full-sequence teacher forcing, not the paper's multi-step rollout simulation), now with proper early stopping and best-checkpoint restore. Honest result across three data scales: top-1 next-token accuracy climbed **4.9% → 17.9% → 20.6%** (40 → 150 → 250 training sequences) — real, consistent learning, never regressing — but the gains are clearly diminishing (+13.0 points, then only +2.6), well short of the target's own ~40% top-1 and not obviously closing that gap with modestly more of the same data (the real EAGLE-3 uses 500K+ distilled examples). Full `speculative_generate` integration is deferred rather than forced — see NOTES.md §16.3 for why, plus a real debugging detour along the way: an apparent training stall at 1000 sequences turned out to be genuine system memory pressure on this shared 16GB machine, not a code bug (confirmed via `vm_stat`, not guessed).
+
+**TTFT pre-warming** (`engine/generate.py::warmup`, `--warmup` in `scripts/run.py`): runs a throwaway prefill-shape and decode-shape forward pass to trigger MLX's lazy-graph compilation before a real request. Confirmed a real, measurable **1.38× first-token speedup on the plain fp16 path** (77.4ms → 56.0ms) — but only ~1.04× (noise-level) on the actual quantized `Q4Linear` serving path, because that path already forces an eager `mx.eval()` per layer to bridge to the NEON kernel, leaving little lazy graph left to warm. Reported as measured, not assumed to help just because the underlying phenomenon is real.
+
 ---
 
 ## Quickstart
@@ -196,7 +221,7 @@ pip install -e ".[dev]"
 # Build NEON kernel (macOS, requires clang++)
 bash siliconfer/kernels/neon/build_kernel.sh
 
-# Tests — 146 fast unit + integration tests (~3s, no model needed)
+# Tests — 193 fast unit + integration tests (~3s, no model needed)
 pytest tests/
 
 # Full suite including logit-parity vs HuggingFace (requires Qwen2.5-0.5B in cache)
@@ -216,6 +241,16 @@ python scripts/run.py \
     --speculative --dynamic_K \
     --prompt "The theory of relativity states that"
 
+# TTFT pre-warming (warms MLX's lazy graph before the timed request)
+python scripts/run.py \
+    --model_id Qwen/Qwen2.5-0.5B --warmup \
+    --prompt "The theory of relativity states that"
+
+# Mixed 2/4-bit precision PPL comparison (algorithm-level only — no packed-kernel
+# serving yet, see NOTES.md §15)
+python scripts/quantize.py --model_id Qwen/Qwen2.5-0.5B --method mixed \
+    --mixed_budget_ratio 0.9 --mixed_permutations 8
+
 # Full benchmark matrix (fp16 + RTN + GPTQ + AWQ + HQQ + SINQ, ~25 min)
 python scripts/run_benchmarks.py \
     --model_id Qwen/Qwen2.5-0.5B \
@@ -229,16 +264,16 @@ python scripts/run_benchmarks.py \
 ```
 siliconfer/
 ├── siliconfer/
-│   ├── model/          # config, llama blocks, RoPE, RMSNorm, GQA attention, kv_cache.py
-│   ├── quant/          # primitives, rtn.py, gptq.py, awq.py, hqq.py, sinq.py, calibration.py
+│   ├── model/          # config, llama blocks, RoPE, RMSNorm, GQA attention, kv_cache.py, draft_head.py
+│   ├── quant/          # primitives, rtn.py, gptq.py, awq.py, hqq.py, sinq.py, mixed_precision.py, calibration.py
 │   ├── kernels/
 │   │   ├── neon/       # q4_gemv.cpp, q4_gemm.cpp, pybind11 bindings, CMakeLists.txt
 │   │   └── metal/      # q4_attention.py — fused quantized-attention mx.fast.metal_kernel
-│   ├── engine/         # generate.py, q4_loader.py, speculative.py
+│   ├── engine/         # generate.py (incl. warmup()), q4_loader.py, speculative.py, draft_training.py
 │   └── eval/           # perplexity.py, bench.py
 ├── eval/               # plots.py (PPL bar, throughput bar, memory bar, roofline)
 ├── scripts/            # run.py, quantize.py, benchmark.py, run_benchmarks.py
-└── tests/              # 150 unit + integration tests
+└── tests/              # 193 unit + integration tests
 ```
 
 ---

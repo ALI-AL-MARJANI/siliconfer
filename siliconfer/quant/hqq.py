@@ -71,7 +71,6 @@ import mlx.core as mx
 
 from siliconfer.model.llama import LlamaModel
 
-_UINT4_MAX = 15
 _EPS = 1e-8
 
 
@@ -87,13 +86,14 @@ def hqq_quantize_weight(
     group_size: int = 128,
     p: float = 0.7,
     k_grid: tuple[float | None, ...] = _DEFAULT_K_GRID,
+    bits: int = 4,
 ) -> np.ndarray:
-    """Quantize a weight matrix with HQQ: asymmetric int4, robust L_p scale/zero fit.
+    """Quantize a weight matrix with HQQ: asymmetric int-`bits`, robust L_p scale/zero fit.
 
     Args:
         W: float32 array, shape [out_features, in_features].
             in_features must be divisible by group_size (or < group_size, see below).
-        group_size: int4 quantization group size (64 or 128).
+        group_size: quantization group size (64 or 128).
         p: exponent of the robust reconstruction loss (0 < p < 2). p=0.7 matches
             the hyper-Laplacian prior used in the original HQQ paper; p=2 would
             recover a plain least-squares criterion (no robustness benefit).
@@ -102,15 +102,23 @@ def hqq_quantize_weight(
             means "no clipping" (plain min-max, i.e. RTN) and is always
             included so HQQ can never be worse than RTN under its own L_p
             objective. Smaller k = more aggressive clipping considered.
+        bits: quantization bit-width (4 = original HQQ int4; 2 lets the same
+            outlier-aware search run at a 4-level grid — added for the
+            mixed-precision low-bit tier, see mixed_precision.py, where plain
+            RTN-int2 was found to be catastrophically lossy on a real model
+            (PPL 500K+) regardless of which layers it's applied to; HQQ's
+            robust clip-range search meaningfully narrows that gap by not
+            letting a handful of outliers dictate the whole 4-level grid).
 
     Returns:
         W_q: float32 array, same shape as W, fake-dequantized (quantize→dequantize).
     """
+    q_max = float(2 ** bits - 1)
     out_features, in_features = W.shape
     if in_features < group_size:
         # Too small to group — fall back to RTN (no outlier search possible)
         from siliconfer.quant.primitives import fake_quantize
-        return fake_quantize(W, group_size=in_features, sym=False)
+        return fake_quantize(W, group_size=in_features, sym=False, bits=bits)
 
     n_groups = in_features // group_size
     W_g = W.reshape(out_features, n_groups, group_size).astype(np.float64)
@@ -132,11 +140,11 @@ def hqq_quantize_weight(
             lo = np.maximum(w_min_full, median - k * robust_std)
             hi = np.minimum(w_max_full, median + k * robust_std)
 
-        scale = (hi - lo) / _UINT4_MAX
+        scale = (hi - lo) / q_max
         scale = np.where(scale <= 0, 1.0, scale)
-        zero = np.clip(np.round(-lo / scale), 0, _UINT4_MAX)
+        zero = np.clip(np.round(-lo / scale), 0, q_max)
 
-        q = np.clip(np.round(W_g / scale + zero), 0, _UINT4_MAX)
+        q = np.clip(np.round(W_g / scale + zero), 0, q_max)
         recon = scale * (q - zero)
 
         # The real, robust (L_p, p<1) reconstruction loss — computed on the
@@ -151,7 +159,7 @@ def hqq_quantize_weight(
             best_scale = np.where(better, scale, best_scale)
             best_zero = np.where(better, zero, best_zero)
 
-    q_final = np.clip(np.round(W_g / best_scale + best_zero), 0, _UINT4_MAX)
+    q_final = np.clip(np.round(W_g / best_scale + best_zero), 0, q_max)
     W_q = (best_scale * (q_final - best_zero)).reshape(out_features, in_features)
     return W_q.astype(np.float32)
 
@@ -161,14 +169,18 @@ def hqq_quantize_weight(
 # ---------------------------------------------------------------------------
 
 def _hqq_weight(
-    w: mx.array, group_size: int, p: float, k_grid: tuple[float | None, ...]
+    w: mx.array,
+    group_size: int,
+    p: float,
+    k_grid: tuple[float | None, ...],
+    bits: int = 4,
 ) -> mx.array:
     """Apply HQQ to a single MLX weight tensor, padding in_features if needed."""
     in_features = w.shape[-1]
     if in_features < group_size:
         from siliconfer.quant.primitives import fake_quantize
         w_np = np.array(w.astype(mx.float32))
-        w_q = fake_quantize(w_np, group_size=in_features, sym=False)
+        w_q = fake_quantize(w_np, group_size=in_features, sym=False, bits=bits)
         return mx.array(w_q).astype(w.dtype)
 
     orig_dtype = w.dtype
@@ -180,7 +192,7 @@ def _hqq_weight(
         pad_shape[-1] = pad
         w_np = np.concatenate([w_np, np.zeros(pad_shape, dtype=np.float32)], axis=-1)
 
-    w_q = hqq_quantize_weight(w_np, group_size=group_size, p=p, k_grid=k_grid)
+    w_q = hqq_quantize_weight(w_np, group_size=group_size, p=p, k_grid=k_grid, bits=bits)
 
     if pad > 0:
         w_q = w_q[..., :in_features]
@@ -193,9 +205,10 @@ def apply_hqq(
     group_size: int = 128,
     p: float = 0.7,
     k_grid: tuple[float | None, ...] = _DEFAULT_K_GRID,
+    bits: int = 4,
     verbose: bool = True,
 ) -> LlamaModel:
-    """Apply HQQ int4 quantization to all attention + MLP projections.
+    """Apply HQQ int-`bits` quantization to all attention + MLP projections.
 
     Unlike GPTQ/AWQ, HQQ needs no calibration data or forward passes — each
     weight tensor is quantized independently and layers can be processed in
@@ -203,9 +216,11 @@ def apply_hqq(
 
     Args:
         model: a loaded LlamaModel (modified in place, returned for convenience).
-        group_size: int4 quantization group size (64 or 128).
+        group_size: quantization group size (64 or 128).
         p: robust loss exponent (0 < p < 2, default 0.7).
         k_grid: candidate robust-z-score outlier thresholds (see hqq_quantize_weight).
+        bits: quantization bit-width (4 = default int4; 2 for the
+            mixed-precision low-bit tier, see mixed_precision.py).
         verbose: print per-layer progress.
 
     Returns:
@@ -220,10 +235,10 @@ def apply_hqq(
         mlp = layer.mlp
 
         for proj in (attn.q_proj, attn.k_proj, attn.v_proj, attn.o_proj):
-            proj.weight = _hqq_weight(proj.weight, group_size, p, k_grid)
+            proj.weight = _hqq_weight(proj.weight, group_size, p, k_grid, bits=bits)
 
         for proj in (mlp.gate_proj, mlp.up_proj, mlp.down_proj):
-            proj.weight = _hqq_weight(proj.weight, group_size, p, k_grid)
+            proj.weight = _hqq_weight(proj.weight, group_size, p, k_grid, bits=bits)
 
         mx.eval(layer.parameters())
 
