@@ -86,6 +86,34 @@ class GenerationResult:
         return self.num_decode_tokens / self.decode_time
 
 
+def warmup(model: LlamaModel, quantize_kv_cache: bool = False) -> None:
+    """Run throwaway forward passes to trigger MLX's lazy-graph compilation
+    before any real request is timed or served.
+
+    MLX (like JAX) builds and compiles its computation graph lazily on first
+    use for each distinct shape/op combination — the first prefill call and
+    the first decode call are different traced shapes, so both are warmed
+    here, not just one. This is a real, documented phenomenon (confirmed via
+    MLX's own compile docs and GitHub issues, not assumed), and "run a dummy
+    forward pass before serving" is the standard, real mitigation for it —
+    see CLAUDE.md's Roadmap C research note for the fact-check that ruled out
+    the fabricated-sounding "out-of-band memory allocator" framing floated
+    for this same problem.
+
+    Call this once right after loading/quantizing a model and before the
+    first `generate()` call whose latency actually matters (e.g. before
+    starting a server loop, or before benchmarking TTFT).
+    """
+    cache = make_quantized_cache(len(model.layers)) if quantize_kv_cache else None
+    prefill_dummy = mx.array([[1, 2]])
+    logits, cache = model(prefill_dummy, cache)
+    mx.eval(logits)
+
+    decode_dummy = mx.array([[1]])
+    logits, cache = model(decode_dummy, cache)
+    mx.eval(logits)
+
+
 def generate(
     model: LlamaModel,
     prompt_ids: mx.array,

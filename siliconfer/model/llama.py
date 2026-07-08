@@ -39,14 +39,29 @@ class LlamaModel(nn.Module):
         self,
         input_ids: mx.array,
         cache: list[tuple[mx.array, mx.array] | QuantizedKVCache] | None = None,
-    ) -> tuple[mx.array, list[tuple[mx.array, mx.array] | QuantizedKVCache]]:
+        feature_layers: list[int] | None = None,
+    ) -> (
+        tuple[mx.array, list[tuple[mx.array, mx.array] | QuantizedKVCache]]
+        | tuple[mx.array, list[tuple[mx.array, mx.array] | QuantizedKVCache], list[mx.array]]
+    ):
+        """Forward pass. Returns (logits, cache) unless `feature_layers` is
+        given, in which case it returns (logits, cache, hidden_states) where
+        hidden_states[i] is this block's output for feature_layers[i] — added
+        for the EAGLE-3-style draft head (model/draft_head.py), which fuses
+        hidden states from a few chosen depths rather than only the final
+        layer. Backward compatible: omitting feature_layers keeps the
+        original 2-tuple return exactly as before.
+        """
         x = self.embed_tokens(input_ids)
 
         new_cache = []
+        by_layer: dict[int, mx.array] = {}
         for i, layer in enumerate(self.layers):
             layer_cache = cache[i] if cache is not None else None
             x, kv = layer(x, layer_cache)
             new_cache.append(kv)
+            if feature_layers is not None and i in feature_layers:
+                by_layer[i] = x
 
         x = self.norm(x)
 
@@ -54,6 +69,16 @@ class LlamaModel(nn.Module):
             logits = self.lm_head(x)
         else:
             logits = self.embed_tokens.as_linear(x)
+
+        if feature_layers is not None:
+            missing = [l for l in feature_layers if l not in by_layer]
+            if missing:
+                raise ValueError(
+                    f"feature_layers={missing} out of range for a "
+                    f"{len(self.layers)}-layer model."
+                )
+            hidden_states = [by_layer[l] for l in feature_layers]
+            return logits, new_cache, hidden_states
 
         return logits, new_cache
 

@@ -14,7 +14,7 @@ from siliconfer.model.config import ModelConfig
 from siliconfer.model.llama import LlamaModel
 from siliconfer.model.q4_linear import Q4Linear
 from siliconfer.engine.q4_loader import _pack_and_replace_linears
-from siliconfer.engine.generate import generate, SamplingParams
+from siliconfer.engine.generate import generate, warmup, SamplingParams
 from siliconfer.kernels.neon import pack_weights_sym, pack_weights_asym, gemv_sym
 from siliconfer.quant.primitives import fake_quantize
 
@@ -274,3 +274,28 @@ def test_generate_on_token_callback():
                       on_token=lambda tok: collected.append(tok))
 
     assert collected == result.token_ids
+
+
+def test_warmup_runs_without_error_and_does_not_affect_generation():
+    """warmup() must be a pure no-observable-effect call: it exercises the
+    prefill and decode traced shapes but must not change the model's weights
+    or leave any state that changes subsequent generate() output."""
+    model = _make_tiny_model(seed=3)
+    _pack_and_replace_linears(model, group_size=_GROUP_SIZE)
+
+    prompt = mx.array([[2, 4, 6]])
+    params = SamplingParams(temperature=0.0, max_tokens=5)
+
+    result_before = generate(model, prompt, params=params)
+    warmup(model)
+    result_after = generate(model, prompt, params=params)
+
+    assert result_after.token_ids == result_before.token_ids
+
+
+def test_warmup_with_quantized_kv_cache():
+    """warmup() must also work when quantize_kv_cache=True (a different
+    traced code path through Attention.__call__ — see model/kv_cache.py)."""
+    model = _make_tiny_model(seed=4)
+    _pack_and_replace_linears(model, group_size=_GROUP_SIZE)
+    warmup(model, quantize_kv_cache=True)  # must not raise

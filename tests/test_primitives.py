@@ -13,6 +13,14 @@ from siliconfer.quant.primitives import (
     dequantize_asym,
     pack_int4,
     unpack_int4,
+    quantize_sym_int2,
+    dequantize_sym_int2,
+    quantize_asym_int2,
+    dequantize_asym_int2,
+    pack_int2,
+    unpack_int2,
+    quantize_sym_n,
+    quantize_asym_n,
     fake_quantize,
 )
 
@@ -202,3 +210,168 @@ def test_group_size_not_divisible_raises():
     w = np.random.randn(8, 100).astype(np.float32)
     with pytest.raises(ValueError, match="not divisible"):
         quantize_sym(w, group_size=128)
+
+
+# ---------------------------------------------------------------------------
+# int2 (mixed-precision groundwork — see quant/mixed_precision.py)
+# ---------------------------------------------------------------------------
+
+def test_sym_int2_q_range():
+    """Symmetric int2 q values must sit in [-2, 1]."""
+    rng = np.random.default_rng(0)
+    w = rng.normal(0, 10, (32, 128)).astype(np.float32)
+    q, _ = quantize_sym_int2(w, group_size=128)
+    assert int(q.min()) >= -2 and int(q.max()) <= 1
+
+
+def test_sym_int2_zero_weight():
+    """All-zero weight should round-trip exactly under int2 too."""
+    w = np.zeros((8, 128), dtype=np.float32)
+    q, scales = quantize_sym_int2(w)
+    w_r = dequantize_sym_int2(q, scales)
+    np.testing.assert_array_equal(q, np.zeros_like(q))
+    np.testing.assert_allclose(w_r, w, atol=1e-6)
+
+
+def test_asym_int2_q_range():
+    """Asymmetric int2 q values must sit in [0, 3]."""
+    rng = np.random.default_rng(0)
+    w = rng.uniform(-5, 5, (32, 128)).astype(np.float32)
+    q, _, _ = quantize_asym_int2(w, group_size=128)
+    assert int(q.min()) >= 0 and int(q.max()) <= 3
+
+
+def test_int2_much_lossier_than_int4():
+    """int2 must have strictly higher reconstruction error than int4 on the same data.
+
+    This is the whole point of int2: it's a knowingly worse fallback, only meant
+    to be assigned to layers a sensitivity estimate says can tolerate it. If this
+    ever stopped holding, the mixed-precision memory/accuracy tradeoff would be
+    nonsensical (paying nothing for the extra error).
+    """
+    rng = np.random.default_rng(42)
+    w = rng.normal(0, 1, (64, 128)).astype(np.float32)
+    w_int4 = fake_quantize(w, group_size=128, sym=True, bits=4)
+    w_int2 = fake_quantize(w, group_size=128, sym=True, bits=2)
+
+    rmse_int4 = float(np.sqrt(np.mean((w - w_int4) ** 2)))
+    rmse_int2 = float(np.sqrt(np.mean((w - w_int2) ** 2)))
+    print(f"\n  int4 RMSE={rmse_int4:.5f}, int2 RMSE={rmse_int2:.5f}")
+    assert rmse_int2 > rmse_int4
+
+
+def test_fake_quantize_invalid_bits_raises():
+    """bits outside [2, 8] must raise — bits=3 itself is now valid (see
+    quantize_sym_n/quantize_asym_n), unlike the earlier bits-in-{2,4}-only
+    version of fake_quantize."""
+    w = np.random.randn(8, 128).astype(np.float32)
+    with pytest.raises(ValueError, match="bits must be"):
+        fake_quantize(w, bits=1)
+    with pytest.raises(ValueError, match="bits must be"):
+        fake_quantize(w, bits=9)
+
+
+def test_fake_quantize_bits_3_works_and_is_between_2_and_4_in_error():
+    """bits=3 (8-level grid) should reconstruct better than bits=2 (4-level)
+    and worse than bits=4 (16-level) — a basic monotonicity sanity check for
+    the generalized arbitrary-bit-width quantizer."""
+    rng = np.random.default_rng(11)
+    w = rng.normal(0, 1, (32, 128)).astype(np.float32)
+
+    w_2 = fake_quantize(w, group_size=128, sym=True, bits=2)
+    w_3 = fake_quantize(w, group_size=128, sym=True, bits=3)
+    w_4 = fake_quantize(w, group_size=128, sym=True, bits=4)
+
+    rmse_2 = float(np.sqrt(np.mean((w - w_2) ** 2)))
+    rmse_3 = float(np.sqrt(np.mean((w - w_3) ** 2)))
+    rmse_4 = float(np.sqrt(np.mean((w - w_4) ** 2)))
+    print(f"\n  bits=2 RMSE={rmse_2:.5f}, bits=3 RMSE={rmse_3:.5f}, bits=4 RMSE={rmse_4:.5f}")
+    assert rmse_2 > rmse_3 > rmse_4
+
+
+def test_quantize_sym_n_matches_quantize_sym_at_bits_4():
+    rng = np.random.default_rng(1)
+    w = rng.normal(0, 1, (16, 128)).astype(np.float32)
+    q_n, scales_n = quantize_sym_n(w, group_size=128, bits=4)
+    q_ref, scales_ref = quantize_sym(w, group_size=128)
+    np.testing.assert_array_equal(q_n, q_ref)
+    np.testing.assert_allclose(scales_n, scales_ref)
+
+
+def test_quantize_sym_n_matches_quantize_sym_int2_at_bits_2():
+    rng = np.random.default_rng(2)
+    w = rng.normal(0, 1, (16, 128)).astype(np.float32)
+    q_n, scales_n = quantize_sym_n(w, group_size=128, bits=2)
+    q_ref, scales_ref = quantize_sym_int2(w, group_size=128)
+    np.testing.assert_array_equal(q_n, q_ref)
+    np.testing.assert_allclose(scales_n, scales_ref)
+
+
+def test_quantize_asym_n_matches_quantize_asym_at_bits_4():
+    rng = np.random.default_rng(3)
+    w = rng.normal(2.0, 1.0, (16, 128)).astype(np.float32)
+    q_n, scales_n, zeros_n = quantize_asym_n(w, group_size=128, bits=4)
+    q_ref, scales_ref, zeros_ref = quantize_asym(w, group_size=128)
+    np.testing.assert_array_equal(q_n, q_ref)
+    np.testing.assert_allclose(scales_n, scales_ref)
+    np.testing.assert_allclose(zeros_n, zeros_ref)
+
+
+def test_quantize_sym_n_bits_out_of_range_raises():
+    w = np.random.randn(8, 128).astype(np.float32)
+    with pytest.raises(ValueError, match="bits must be in"):
+        quantize_sym_n(w, bits=1)
+    with pytest.raises(ValueError, match="bits must be in"):
+        quantize_sym_n(w, bits=9)
+
+
+def test_pack_unpack_int2_signed():
+    """Pack → unpack must recover all signed int2 values in [-2, 1]."""
+    rng = np.random.default_rng(7)
+    original = rng.integers(-2, 2, size=(64,), dtype=np.int8)
+    packed = pack_int2(original)
+    assert packed.shape == (16,), f"Expected (16,), got {packed.shape}"
+    recovered = unpack_int2(packed, n=64, signed=True)
+    np.testing.assert_array_equal(original, recovered)
+
+
+def test_pack_unpack_int2_unsigned():
+    """Pack → unpack must recover all unsigned int2 values in [0, 3]."""
+    rng = np.random.default_rng(13)
+    original = rng.integers(0, 4, size=(128,), dtype=np.uint8)
+    packed = pack_int2(original)
+    assert packed.shape == (32,)
+    recovered = unpack_int2(packed, n=128, signed=False)
+    np.testing.assert_array_equal(original, recovered)
+
+
+def test_pack_unpack_int2_boundary_values():
+    """Boundary int2 values -2 and 1 must survive a round-trip."""
+    values = np.array([-2, -1, 0, 1, -2, 1, 0, -1], dtype=np.int8)
+    packed = pack_int2(values)
+    recovered = unpack_int2(packed, n=8, signed=True)
+    np.testing.assert_array_equal(values, recovered)
+
+
+def test_pack_int2_not_divisible_by_4_raises():
+    with pytest.raises(ValueError, match="divisible by 4"):
+        pack_int2(np.array([1, 2, 3], dtype=np.int8))
+
+
+def test_pack_int2_size_quartered():
+    """Packed int2 array must be exactly a quarter of the input size."""
+    q = np.zeros(256, dtype=np.int8)
+    packed = pack_int2(q)
+    assert packed.size == 64
+
+
+def test_int2_asym_round_trip_close():
+    """Asymmetric int2 quantize -> dequantize error must be bounded by the group scale."""
+    rng = np.random.default_rng(7)
+    w = rng.normal(2.0, 1.0, (64, 128)).astype(np.float32)
+    q, scales, zeros = quantize_asym_int2(w, group_size=128)
+    w_r = dequantize_asym_int2(q, scales, zeros, group_size=128)
+
+    max_scale = float(scales.max())
+    max_err = float(np.abs(w - w_r).max())
+    assert max_err <= max_scale + 1e-5, f"Max error {max_err} > max_scale {max_scale}"

@@ -5,6 +5,8 @@ from siliconfer.quant.primitives import (
     dequantize_asym,
     pack_int4,
     unpack_int4,
+    quantize_sym_n,
+    quantize_asym_n,
     fake_quantize,
 )
 from siliconfer.quant.rtn import apply_rtn
@@ -18,6 +20,12 @@ from siliconfer.quant.awq import (
 )
 from siliconfer.quant.hqq import hqq_quantize_weight, apply_hqq
 from siliconfer.quant.sinq import sinq_quantize_weight, apply_sinq
+from siliconfer.quant.mixed_precision import (
+    shapley_layer_sensitivity,
+    assign_bitwidths,
+    make_block_nll_value_fn,
+    apply_mixed_precision,
+)
 
 __all__ = [
     "quantize_sym",
@@ -26,6 +34,8 @@ __all__ = [
     "dequantize_asym",
     "pack_int4",
     "unpack_int4",
+    "quantize_sym_n",
+    "quantize_asym_n",
     "fake_quantize",
     "apply_rtn",
     "load_calibration_sequences",
@@ -40,4 +50,8 @@ __all__ = [
     "apply_hqq",
     "sinq_quantize_weight",
     "apply_sinq",
+    "shapley_layer_sensitivity",
+    "assign_bitwidths",
+    "make_block_nll_value_fn",
+    "apply_mixed_precision",
 ]

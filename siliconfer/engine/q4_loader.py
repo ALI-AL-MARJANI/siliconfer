@@ -4,7 +4,10 @@ Usage:
     from siliconfer.engine.q4_loader import load_q4_model
     model, config = load_q4_model(model_dir, method="rtn")
 
-Supported methods: "rtn", "gptq", "awq", "hqq", "sinq".
+Supported methods: "rtn", "gptq", "awq", "hqq", "sinq". "mixed" (2/4-bit mixed
+precision, quant/mixed_precision.py) is deliberately NOT served here yet — see
+the ValueError in load_q4_model for why; use scripts/quantize.py --method
+mixed for algorithm-level PPL validation instead.
 """
 
 from __future__ import annotations
@@ -135,6 +138,20 @@ def load_q4_model(
         from siliconfer.quant.sinq import apply_sinq
         apply_sinq(model, group_size=group_size, sym=sym, verbose=verbose)
         mx.eval(model.parameters())
+
+    elif method == "mixed":
+        raise ValueError(
+            "method='mixed' is not supported here yet: _pack_and_replace_linears/Q4Linear "
+            "only know how to pack a 4-bit (nibble) grid. Packing a 2-bit-quantized layer "
+            "through the 4-bit packer would silently re-fit new scale/zero values onto a "
+            "4-bit grid and store 4 bits per weight anyway — the exact same class of "
+            "silent-mismatch bug documented in CLAUDE.md §9 for asymmetric packing, just "
+            "for bit-width instead of symmetry. A real int2 packed kernel (2-bit "
+            "nibble-of-4 packing + NEON GEMV/GEMM) is required before 'mixed' can be "
+            "served through this path; use scripts/quantize.py --method mixed for the "
+            "algorithm-level PPL comparison in the meantime (matches how every other "
+            "method here was validated before its packed-kernel integration existed)."
+        )
 
     elif method in ("gptq", "awq"):
         mid = calib_model_id or model_dir.name
