@@ -19,6 +19,7 @@ from dataclasses import dataclass
 import mlx.core as mx
 
 from siliconfer.engine.generate import SamplingParams
+from siliconfer.model.kv_cache import QuantizedKVCache, make_quantized_cache
 
 
 # ---------------------------------------------------------------------------
@@ -26,7 +27,17 @@ from siliconfer.engine.generate import SamplingParams
 # ---------------------------------------------------------------------------
 
 def _trim_cache(cache, n: int):
-    """Return cache sliced to first n KV positions (cheap MLX view)."""
+    """Return cache sliced to first n KV positions (cheap MLX view).
+
+    Handles both cache representations Attention.__call__ accepts (Phase 9b):
+    plain (k, v) tuples are sliced into new arrays; QuantizedKVCache objects
+    are trimmed in place (their own .trim() mutates packed codes + scales
+    directly) and the same objects are returned.
+    """
+    if cache and isinstance(cache[0], QuantizedKVCache):
+        for c in cache:
+            c.trim(n)
+        return cache
     return [(k[:, :, :n, :], v[:, :, :n, :]) for k, v in cache]
 
 
@@ -72,6 +83,31 @@ def _sample_adjusted(
     tok = mx.random.categorical(mx.log(adj + 1e-30))
     mx.eval(tok)
     return int(tok.item())
+
+
+
+# ---------------------------------------------------------------------------
+# Phase 9d research note: a multi-candidate "retry with a fresh draft sample"
+# scheme was attempted here and rejected after rigorous testing found it is
+# NOT lossless. The intuition ("relative winning probabilities among i.i.d.
+# retries don't depend on the number of trials") is true and easy to prove,
+# but the conclusion drawn from it was wrong: as retry count M grows, values
+# favored more by the draft model than the target model get accepted via the
+# accept-path *more* than their fair p_target share, and there is no way to
+# correct for this via an independent fallback draw — the exact fallback
+# formula that would be required works out to a NEGATIVE probability for some
+# tokens (confirmed algebraically, not just empirically: for M=2 candidates,
+# `p_target(v) - min(p_draft(v),p_target(v))*(2-Z)` goes negative whenever
+# p_draft(v) >= p_target(v) and Z is small enough). Clamping negatives to
+# zero would "fix" this into a valid distribution but makes the scheme only
+# *approximately* lossless — inconsistent with this project's standard of
+# exact, provable correctness for speculative decoding (Phase 8's algorithm
+# is verified via exact greedy token-for-token match, not just "close").
+# This is exactly why the real tree-attention literature (SpecInfer, EAGLE-2)
+# needs careful *correlated* multi-candidate verification, not naive
+# independent retries — a genuinely harder problem than this shortcut
+# assumed. See `dynamic_K` below for what Phase 9d actually ships instead.
+# ---------------------------------------------------------------------------
 
 
 # ---------------------------------------------------------------------------
@@ -121,6 +157,10 @@ def speculative_generate(
     eos_token_id: int | None = None,
     on_token: "Callable[[int], None] | None" = None,
     seed: int | None = None,
+    dynamic_K: bool = False,
+    K_min: int = 1,
+    K_max: int = 8,
+    quantize_kv_cache: bool = False,
 ) -> SpeculativeResult:
     """Generate tokens using speculative decoding.
 
@@ -130,15 +170,41 @@ def speculative_generate(
         prompt_ids:     [1, T] or [T] integer array (prompt token ids).
         params:         Sampling parameters (temperature, top_p, etc.).
         K:              Speculation depth — number of draft tokens per round.
+                        With dynamic_K=True this is only the *starting* depth.
         eos_token_id:   Stop generation when this token is produced.
         on_token:       Callback invoked with each accepted/sampled token id.
         seed:           Random seed for reproducible sampling.
+        dynamic_K:      (Phase 9d) adapt K round-to-round based on the running
+                        acceptance rate — speculate deeper after rounds that
+                        accepted everything (the draft model is "in sync" with
+                        the target right now), pull back after a round rejects
+                        early (wasted draft compute). This changes only which
+                        K value each round's *already-proven-lossless*
+                        rejection-sampling algorithm uses — K never appears in
+                        that correctness proof, so this is losslessness-neutral
+                        by construction (unlike multi-candidate schemes, see
+                        the research note above `dynamic_K` docstring in the
+                        module — that approach was tried and found NOT lossless).
+        K_min, K_max:   Bounds for dynamic_K's adaptation.
+        quantize_kv_cache: (Phase 9b+9d) store both draft's and target's KV
+                        cache as group-wise int8 instead of fp16. `_trim_cache`
+                        and `Attention.__call__` already handle both cache
+                        representations transparently (Phase 9b), so this is
+                        just correctly initializing both caches with
+                        `make_quantized_cache()` instead of `None`. Note this
+                        makes speculative decoding exactly reproduce
+                        *non-speculative generation from this same
+                        quantized-cache model* (verified — see
+                        `test_speculative.py`), not the fp16-cache model's
+                        output; quantized-cache decoding is itself only
+                        approximately equal to fp16 (Phase 9b: ΔPPL ≈ +1.2).
 
     Returns:
         SpeculativeResult with token_ids and statistics.
 
     Algorithm (per round):
-        1. Draft generates K tokens autoregressively from the last accepted token.
+        1. Draft generates K tokens autoregressively from the last accepted token
+           (K itself may change round-to-round if dynamic_K=True).
         2. Target verifies [last_accepted, d_0, ..., d_{K-1}] in one forward pass
            (K+1 tokens), producing K+1 logit vectors.
         3. For q = 0 .. K-1:
@@ -149,6 +215,9 @@ def speculative_generate(
         4. If all K accepted: sample one bonus token from target_logits[:, K, :].
         5. Output accepted tokens + the bonus/replacement token.
         6. Trim KV caches to match the committed context length.
+        7. If dynamic_K: adjust K for the next round based on whether this
+           round accepted everything (K += 1, capped at K_max) or rejected
+           early (K -= 1, floored at K_min).
     """
     if params is None:
         params = SamplingParams()
@@ -161,9 +230,12 @@ def speculative_generate(
     temp = params.temperature
 
     # ------------------------------------------------------------------ prefill
+    target_cache = make_quantized_cache(len(target.layers)) if quantize_kv_cache else None
+    draft_cache = make_quantized_cache(len(draft.layers)) if quantize_kv_cache else None
+
     t0 = time.perf_counter()
-    t_logits, target_cache = target(prompt_ids)
-    d_logits, draft_cache  = draft(prompt_ids)
+    t_logits, target_cache = target(prompt_ids, target_cache)
+    d_logits, draft_cache  = draft(prompt_ids, draft_cache)
     mx.eval(t_logits, d_logits)
     t_prefill = time.perf_counter()
 
@@ -180,15 +252,19 @@ def speculative_generate(
     total_draft_tokens = 0
     total_accepted = 0
 
+    cur_K = K
+
     t_decode_start = time.perf_counter()
 
     while len(generated) < params.max_tokens:
+        round_K = cur_K   # this round's speculation depth (cur_K may change below)
+
         # --------------------------------------------------------- draft phase
         draft_tokens: list[int] = []
         draft_logits_list: list[mx.array] = []  # each [1, 1, vocab]
 
         d_input = mx.array([[cur_tok]])
-        for _ in range(K):
+        for _ in range(round_K):
             d_log, draft_cache = draft(d_input, draft_cache)
             mx.eval(d_log)
             d_id = _sample_logits(d_log[0, 0], temp)
@@ -196,21 +272,21 @@ def speculative_generate(
             draft_logits_list.append(d_log)
             d_input = mx.array([[d_id]])
 
-        total_draft_tokens += K
+        total_draft_tokens += round_K
 
         # -------------------------------------------------------- target verify
-        # Batch [cur_tok, d_0, ..., d_{K-1}] — K+1 tokens at positions N..N+K
-        verify_ids = mx.array([[cur_tok] + draft_tokens])  # [1, K+1]
+        # Batch [cur_tok, d_0, ..., d_{round_K-1}] — round_K+1 tokens at positions N..N+round_K
+        verify_ids = mx.array([[cur_tok] + draft_tokens])  # [1, round_K+1]
         t_log, target_cache = target(verify_ids, target_cache)
         mx.eval(t_log)
         # t_log[0, q] = target logits for predicting draft_tokens[q]
-        # t_log[0, K] = target logits for the bonus token
+        # t_log[0, round_K] = target logits for the bonus token
 
         # ------------------------------------------------------ rejection sample
-        j = K  # number of accepted draft tokens (default: all)
+        j = round_K  # number of accepted draft tokens (default: all)
         replacement = -1
 
-        for q in range(K):
+        for q in range(round_K):
             p_t = _tok_prob(t_log[0, q], draft_tokens[q], temp)
             p_d = _tok_prob(draft_logits_list[q][0, 0], draft_tokens[q], temp)
 
@@ -223,10 +299,20 @@ def speculative_generate(
             replacement = _sample_adjusted(t_log[0, q], draft_logits_list[q][0, 0], temp)
             break
         else:
-            # All K accepted — sample bonus from target_logits[:, K, :]
-            replacement = _sample_logits(t_log[0, K], temp)
+            # All round_K accepted — sample bonus from target_logits[:, round_K, :]
+            replacement = _sample_logits(t_log[0, round_K], temp)
 
         total_accepted += j
+
+        # ------------------------------------------- dynamic K adaptation
+        # K never appears in the accept/reject correctness proof above — this
+        # only changes how many tokens the *next* round speculates, which is
+        # losslessness-neutral by construction.
+        if dynamic_K:
+            if j == round_K:
+                cur_K = min(round_K + 1, K_max)   # fully accepted — speculate deeper
+            else:
+                cur_K = max(round_K - 1, K_min)   # rejected early — pull back
 
         # ------------------------------------------- commit accepted tokens
         # Clip batch to remaining budget before appending (on_token must not
@@ -247,13 +333,13 @@ def speculative_generate(
 
         target_cache = _trim_cache(target_cache, new_N)
 
-        if j == K:
-            # draft_cache at N+K; d_{K-1} accepted but never INPUT to draft.
-            # Run draft on d_{K-1} to extend its cache to N+K+1 = new_N.
-            _, draft_cache = draft(mx.array([[draft_tokens[K - 1]]]), draft_cache)
+        if j == round_K:
+            # draft_cache at N+round_K; d_{round_K-1} accepted but never INPUT to draft.
+            # Run draft on d_{round_K-1} to extend its cache to N+round_K+1 = new_N.
+            _, draft_cache = draft(mx.array([[draft_tokens[round_K - 1]]]), draft_cache)
             mx.eval(draft_cache)
         else:
-            # draft_cache at N+K from the speculation run; trim to new_N.
+            # draft_cache at N+round_K from the speculation run; trim to new_N.
             draft_cache = _trim_cache(draft_cache, new_N)
 
         N = new_N

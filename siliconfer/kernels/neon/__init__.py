@@ -49,7 +49,8 @@ def pack_weights_sym(W: np.ndarray, group_size: int = 128) -> tuple[np.ndarray, 
     Returns:
         packed: uint8 array [out_features, in_features // 2]
                 lo nibble = even channel, hi nibble = odd channel,
-                nibble encoding: 0..15 where 0 maps to -8, 8 maps to 0, 15 to 7.
+                nibble encoding: two's complement — 0..7 map to 0..7,
+                8..15 map to -8..-1 (sign-extend the nibble, then * scale).
         scales: float32 array [out_features, n_groups].
     """
     from siliconfer.quant.primitives import quantize_sym
@@ -102,6 +103,24 @@ def _numpy_gemv_sym(packed, scales, x, group_size):
         W_g[:, 1::2] = hi_s
         x_g = x[g * group_size:(g + 1) * group_size]
         y += (W_g @ x_g) * scales[:, g]
+    return y
+
+
+def _numpy_gemv_asym(packed, scales, zeros, x, group_size):
+    """Pure numpy reference asymmetric GEMV (no C++ required)."""
+    out_f, in_h = packed.shape
+    in_f = in_h * 2
+    n_groups = in_f // group_size
+    y = np.zeros(out_f, dtype=np.float32)
+    for g in range(n_groups):
+        lo = (packed[:, g * group_size // 2:(g + 1) * group_size // 2] & 0x0F).astype(np.float32)
+        hi = (packed[:, g * group_size // 2:(g + 1) * group_size // 2] >> 4).astype(np.float32)
+        W_g = np.empty((out_f, group_size), dtype=np.float32)
+        W_g[:, 0::2] = lo
+        W_g[:, 1::2] = hi
+        x_g = x[g * group_size:(g + 1) * group_size]
+        # dequant = (nibble - zero) * scale
+        y += (W_g @ x_g - zeros[:, g] * x_g.sum()) * scales[:, g]
     return y
 
 
@@ -178,6 +197,36 @@ def gemm_sym(
     return Y
 
 
+def gemm_asym(
+    packed: np.ndarray,
+    scales: np.ndarray,
+    zeros: np.ndarray,
+    X: np.ndarray,
+    group_size: int = 128,
+) -> np.ndarray:
+    """NEON q4 asymmetric GEMM: Y[T, out] = X[T, in] @ (W_q4 - zero).T * scale.
+
+    Prefill-path counterpart to `gemv_asym` (decode). Added to let Q4Linear
+    correctly serve asymmetrically-quantized weights (e.g. HQQ, which is
+    always asymmetric) instead of the pre-existing gap where every method got
+    silently re-packed as symmetric regardless of how it was actually
+    quantized — see CLAUDE.md §9.
+    """
+    packed = np.ascontiguousarray(packed, dtype=np.uint8)
+    scales = np.ascontiguousarray(scales, dtype=np.float32)
+    zeros  = np.ascontiguousarray(zeros,  dtype=np.float32)
+    X      = np.ascontiguousarray(X,      dtype=np.float32)
+    if _lib is not None:
+        return _lib.q4_gemm_asym(packed, scales, zeros, X, group_size)
+    # Numpy fallback: loop over tokens
+    T = X.shape[0]
+    out_f = packed.shape[0]
+    Y = np.empty((T, out_f), dtype=np.float32)
+    for t in range(T):
+        Y[t] = _numpy_gemv_asym(packed, scales, zeros, X[t], group_size)
+    return Y
+
+
 __all__ = [
     "NEON_AVAILABLE",
     "pack_weights_sym",
@@ -186,4 +235,5 @@ __all__ = [
     "gemv_scalar",
     "gemv_asym",
     "gemm_sym",
+    "gemm_asym",
 ]

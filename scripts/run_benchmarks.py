@@ -1,7 +1,8 @@
 """Phase 7 benchmark runner: produces the full results table.
 
 Measures tok/s (prefill + decode), weight memory, and optionally PPL for:
-  fp16 (MLX baseline), RTN-int4, GPTQ-int4 (--full), AWQ-int4 (--full)
+  fp16 (MLX baseline), RTN-int4, GPTQ-int4 (--full), AWQ-int4 (--full),
+  HQQ-int4 (--full), SINQ-int4 (--full)
 
 Results are saved to results.json and plots are auto-generated.
 
@@ -12,7 +13,7 @@ Usage:
     # With PPL (fast estimate, ~5 min extra):
     python scripts/run_benchmarks.py --model_id Qwen/Qwen2.5-0.5B --ppl --max_ppl_tokens 5000
 
-    # Full matrix including GPTQ + AWQ PPL (~20 min):
+    # Full matrix including GPTQ + AWQ + HQQ + SINQ PPL (~25 min):
     python scripts/run_benchmarks.py --model_id Qwen/Qwen2.5-0.5B --full
 
 Output:
@@ -207,6 +208,42 @@ def main() -> None:
             print(f"    WikiText-2 PPL = {ppl_awq:.2f}")
 
         del model_awq
+
+    # ------------------------------------------------------------------ HQQ
+    if args.full:
+        print("\n=== HQQ-int4 ===")
+        t0 = time.perf_counter()
+        model_hqq, _ = load_q4_model(
+            model_dir, method="hqq", group_size=args.group_size, verbose=True,
+        )
+        print(f"  loaded in {time.perf_counter()-t0:.1f}s")
+        results["hqq"] = _bench_one("hqq", model_hqq, prompt_ids, args.n_decode, args.n_runs)
+
+        if args.ppl:
+            print("  measuring PPL ...", flush=True)
+            ppl_hqq = _run_ppl(model_hqq, config, tokenizer_id, args.max_ppl_tokens)
+            results["hqq"]["ppl"] = ppl_hqq
+            print(f"    WikiText-2 PPL = {ppl_hqq:.2f}")
+
+        del model_hqq
+
+    # ------------------------------------------------------------------ SINQ
+    if args.full:
+        print("\n=== SINQ-int4 ===")
+        t0 = time.perf_counter()
+        model_sinq, _ = load_q4_model(
+            model_dir, method="sinq", group_size=args.group_size, verbose=True,
+        )
+        print(f"  loaded in {time.perf_counter()-t0:.1f}s")
+        results["sinq"] = _bench_one("sinq", model_sinq, prompt_ids, args.n_decode, args.n_runs)
+
+        if args.ppl:
+            print("  measuring PPL ...", flush=True)
+            ppl_sinq = _run_ppl(model_sinq, config, tokenizer_id, args.max_ppl_tokens)
+            results["sinq"]["ppl"] = ppl_sinq
+            print(f"    WikiText-2 PPL = {ppl_sinq:.2f}")
+
+        del model_sinq
 
     # ------------------------------------------------------------------ kernel stats
     results["kernel"] = {

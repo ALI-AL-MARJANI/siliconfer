@@ -13,6 +13,7 @@ from siliconfer.model.layers import (
     TransformerBlock,
     _compute_rope_freqs,
 )
+from siliconfer.model.kv_cache import QuantizedKVCache
 from siliconfer.engine.loader import load_model, weight_summary
 
 
@@ -37,8 +38,8 @@ class LlamaModel(nn.Module):
     def __call__(
         self,
         input_ids: mx.array,
-        cache: list[tuple[mx.array, mx.array]] | None = None,
-    ) -> tuple[mx.array, list[tuple[mx.array, mx.array]]]:
+        cache: list[tuple[mx.array, mx.array] | QuantizedKVCache] | None = None,
+    ) -> tuple[mx.array, list[tuple[mx.array, mx.array] | QuantizedKVCache]]:
         x = self.embed_tokens(input_ids)
 
         new_cache = []

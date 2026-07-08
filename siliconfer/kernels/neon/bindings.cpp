@@ -5,6 +5,7 @@
 //   q4_gemv_scalar(W, scales, x, group_size) → y  (reference)
 //   q4_gemm_sym(W, scales, X, group_size) → Y
 //   q4_gemv_asym(W, scales, zeros, x, group_size) → y
+//   q4_gemm_asym(W, scales, zeros, X, group_size) → Y
 //   neon_available() → bool
 //
 // Weight packing is done in Python (siliconfer/kernels/neon/__init__.py).
@@ -118,6 +119,37 @@ pyf32 q4_gemm_sym_bind(const pyu8& W, const pyf32& scales, const pyf32& X, int g
 }
 
 // ---------------------------------------------------------------------------
+// q4_gemm_asym — X[T, in_f] → Y[T, out_f], asymmetric
+// ---------------------------------------------------------------------------
+pyf32 q4_gemm_asym_bind(const pyu8& W, const pyf32& scales, const pyf32& zeros,
+                         const pyf32& X, int group_size) {
+    auto bW = W.request(), bs = scales.request(), bX = X.request();
+    if (bW.ndim != 2) throw std::runtime_error("W must be 2-D");
+    if (bX.ndim != 2) throw std::runtime_error("X must be 2-D [T, in_f]");
+
+    int out_f  = (int)bW.shape[0];
+    int in_f   = (int)bW.shape[1] * 2;
+    int T      = (int)bX.shape[0];
+    int n_grp  = in_f / group_size;
+
+    if ((int)bX.shape[1] != in_f)  throw std::runtime_error("X/W in_features mismatch");
+    if (bs.shape[0] != out_f || bs.shape[1] != n_grp)
+        throw std::runtime_error("scales shape mismatch");
+
+    auto bz = zeros.request();
+    if (bz.ndim != 2 || bz.shape[0] != out_f || bz.shape[1] != n_grp)
+        throw std::runtime_error("zeros shape mismatch");
+
+    auto Y = py::array_t<float>({T, out_f});
+    q4_gemm_asym_neon(
+        (const uint8_t*)W.data(), scales.data(), zeros.data(), X.data(),
+        (float*)Y.mutable_data(),
+        out_f, in_f, T, group_size
+    );
+    return Y;
+}
+
+// ---------------------------------------------------------------------------
 // Module
 // ---------------------------------------------------------------------------
 PYBIND11_MODULE(siliconfer_neon, m) {
@@ -139,6 +171,11 @@ PYBIND11_MODULE(siliconfer_neon, m) {
     m.def("q4_gemm_sym",    &q4_gemm_sym_bind,
           "q4 GEMM (symmetric int4), Y = X @ W_q4.T  (prefill)",
           py::arg("W"), py::arg("scales"), py::arg("X"), py::arg("group_size") = 128);
+
+    m.def("q4_gemm_asym",   &q4_gemm_asym_bind,
+          "q4 GEMM (asymmetric int4), Y = X @ (W_q4 - zero).T * scale  (prefill)",
+          py::arg("W"), py::arg("scales"), py::arg("zeros"), py::arg("X"),
+          py::arg("group_size") = 128);
 
 #ifdef __ARM_NEON
     m.def("neon_available", []() { return true; });

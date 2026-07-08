@@ -7,7 +7,8 @@
 //
 // Weight layout: W_packed[out_f, in_f/2]
 //   byte j in row i holds: lo nibble = w(i, 2j), hi nibble = w(i, 2j+1)
-//   nibble encoding: unsigned in [0,15]; dequant = (nibble - 8) * scale
+//   nibble encoding: two's complement in [0,15]; values 0..7 map to 0..7,
+//   values 8..15 map to -8..-1 (dequant sign-extends the nibble, then * scale)
 //   (matches pack_int4 from siliconfer/quant/primitives.py)
 //
 // scales[out_f, n_groups], n_groups = in_f / group_size
@@ -45,6 +46,16 @@ void q4_gemv_asym_neon(
 void q4_gemm_sym_neon(
     const uint8_t* __restrict__ W,
     const float*   __restrict__ scales,
+    const float*   __restrict__ X,
+    float*         __restrict__ Y,
+    int out_f, int in_f, int T, int group_size
+);
+
+// GEMM (prefill), asymmetric: X[T, in_f] → Y[T, out_f]
+void q4_gemm_asym_neon(
+    const uint8_t* __restrict__ W,
+    const float*   __restrict__ scales,
+    const float*   __restrict__ zeros,
     const float*   __restrict__ X,
     float*         __restrict__ Y,
     int out_f, int in_f, int T, int group_size

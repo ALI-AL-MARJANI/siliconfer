@@ -1,9 +1,11 @@
-"""End-to-end quantization script: fp16 / RTN / GPTQ / AWQ PPL on WikiText-2.
+"""End-to-end quantization script: fp16 / RTN / GPTQ / AWQ / HQQ / SINQ PPL on WikiText-2.
 
 Usage:
     python scripts/quantize.py --model_id Qwen/Qwen2.5-0.5B
     python scripts/quantize.py --model_id Qwen/Qwen2.5-0.5B --method gptq
     python scripts/quantize.py --model_id Qwen/Qwen2.5-0.5B --method awq
+    python scripts/quantize.py --model_id Qwen/Qwen2.5-0.5B --method hqq
+    python scripts/quantize.py --model_id Qwen/Qwen2.5-0.5B --method sinq
     python scripts/quantize.py --model_id Qwen/Qwen2.5-0.5B --method all --max_tokens 10000
 """
 
@@ -19,6 +21,8 @@ from siliconfer.quant.rtn import apply_rtn
 from siliconfer.quant.calibration import load_calibration_sequences
 from siliconfer.quant.gptq import apply_gptq
 from siliconfer.quant.awq import apply_awq
+from siliconfer.quant.hqq import apply_hqq
+from siliconfer.quant.sinq import apply_sinq
 from siliconfer.eval.perplexity import compute_perplexity
 
 
@@ -39,7 +43,7 @@ def main() -> None:
     parser.add_argument("--model_dir", default=None,
                         help="Local path to model dir (skips HF download).")
     parser.add_argument("--method", default="rtn",
-                        choices=["rtn", "gptq", "awq", "all"],
+                        choices=["rtn", "gptq", "awq", "hqq", "sinq", "all"],
                         help="Quantization method(s) to run (default: rtn).")
     parser.add_argument("--group_size", type=int, default=128)
     parser.add_argument("--asym", action="store_true",
@@ -59,6 +63,8 @@ def main() -> None:
     run_rtn  = args.method in ("rtn",  "all")
     run_gptq = args.method in ("gptq", "all")
     run_awq  = args.method in ("awq",  "all")
+    run_hqq  = args.method in ("hqq",  "all")
+    run_sinq = args.method in ("sinq", "all")
 
     results: list[tuple[str, float]] = []
 
@@ -140,6 +146,44 @@ def main() -> None:
         )
         results.append((label, ppl_awq))
         del model_awq
+
+    # ------------------------------------------------------------------ HQQ
+    if run_hqq:
+        # HQQ is inherently asymmetric (its whole point is the zero-point fit),
+        # so the sym/asym suffix used by the other methods doesn't apply here.
+        label = f"HQQ-int4  g{args.group_size}"
+        print(f"\n=== Applying {label} ===")
+        print("  (no calibration data needed)")
+
+        model_hqq, _ = LlamaModel.from_pretrained(model_dir, dtype=mx.float16)
+        apply_hqq(model_hqq, group_size=args.group_size, verbose=True)
+        mx.eval(model_hqq.parameters())
+
+        print(f"\n--- {label} WikiText-2 PPL ---")
+        ppl_hqq = compute_perplexity(
+            model_hqq, config, args.model_id,
+            seq_len=args.seq_len, max_tokens=args.max_tokens,
+        )
+        results.append((label, ppl_hqq))
+        del model_hqq
+
+    # ----------------------------------------------------------------- SINQ
+    if run_sinq:
+        label = f"SINQ-int4 {quant_suffix}"
+        print(f"\n=== Applying {label} ===")
+        print("  (no calibration data needed)")
+
+        model_sinq, _ = LlamaModel.from_pretrained(model_dir, dtype=mx.float16)
+        apply_sinq(model_sinq, group_size=args.group_size, sym=sym, verbose=True)
+        mx.eval(model_sinq.parameters())
+
+        print(f"\n--- {label} WikiText-2 PPL ---")
+        ppl_sinq = compute_perplexity(
+            model_sinq, config, args.model_id,
+            seq_len=args.seq_len, max_tokens=args.max_tokens,
+        )
+        results.append((label, ppl_sinq))
+        del model_sinq
 
     # ------------------------------------------------------------------ table
     ref_ppl = results[0][1]

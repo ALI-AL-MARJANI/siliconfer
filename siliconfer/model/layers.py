@@ -8,6 +8,7 @@ import mlx.core as mx
 import mlx.nn as nn
 
 from siliconfer.model.config import ModelConfig
+from siliconfer.model.kv_cache import QuantizedKVCache
 
 
 class RMSNorm(nn.Module):
@@ -85,15 +86,19 @@ class Attention(nn.Module):
     def __call__(
         self,
         x: mx.array,
-        cache: tuple[mx.array, mx.array] | None = None,
-    ) -> tuple[mx.array, tuple[mx.array, mx.array]]:
+        cache: tuple[mx.array, mx.array] | QuantizedKVCache | None = None,
+    ) -> tuple[mx.array, tuple[mx.array, mx.array] | QuantizedKVCache]:
         B, T, _ = x.shape
 
         q = self.q_proj(x).reshape(B, T, self.num_heads, self.head_dim).transpose(0, 2, 1, 3)
         k = self.k_proj(x).reshape(B, T, self.num_kv_heads, self.head_dim).transpose(0, 2, 1, 3)
         v = self.v_proj(x).reshape(B, T, self.num_kv_heads, self.head_dim).transpose(0, 2, 1, 3)
 
-        if cache is not None:
+        quantized_cache = isinstance(cache, QuantizedKVCache)
+
+        if quantized_cache:
+            offset = cache.length()
+        elif cache is not None:
             prev_k, prev_v = cache
             offset = prev_k.shape[2]
         else:
@@ -102,9 +107,15 @@ class Attention(nn.Module):
         q = apply_rope(q, offset, self.rope_freqs)
         k = apply_rope(k, offset, self.rope_freqs)
 
-        if cache is not None:
+        if quantized_cache:
+            k, v = cache.update(k, v)
+            new_cache = cache
+        elif cache is not None:
             k = mx.concatenate([prev_k, k], axis=2)
             v = mx.concatenate([prev_v, v], axis=2)
+            new_cache = (k, v)
+        else:
+            new_cache = (k, v)
 
         mask = None
         if T > 1:
@@ -119,7 +130,7 @@ class Attention(nn.Module):
         )
 
         out = out.transpose(0, 2, 1, 3).reshape(B, T, -1)
-        return self.o_proj(out), (k, v)
+        return self.o_proj(out), new_cache
 
 
 class MLP(nn.Module):
@@ -144,8 +155,8 @@ class TransformerBlock(nn.Module):
     def __call__(
         self,
         x: mx.array,
-        cache: tuple[mx.array, mx.array] | None = None,
-    ) -> tuple[mx.array, tuple[mx.array, mx.array]]:
+        cache: tuple[mx.array, mx.array] | QuantizedKVCache | None = None,
+    ) -> tuple[mx.array, tuple[mx.array, mx.array] | QuantizedKVCache]:
         h, new_cache = self.self_attn(self.input_layernorm(x), cache)
         x = x + h
         x = x + self.mlp(self.post_attention_layernorm(x))

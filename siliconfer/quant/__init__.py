@@ -16,6 +16,8 @@ from siliconfer.quant.awq import (
     fold_scale_into_norm,
     apply_awq,
 )
+from siliconfer.quant.hqq import hqq_quantize_weight, apply_hqq
+from siliconfer.quant.sinq import sinq_quantize_weight, apply_sinq
 
 __all__ = [
     "quantize_sym",
@@ -34,4 +36,8 @@ __all__ = [
     "awq_quantize_weight",
     "fold_scale_into_norm",
     "apply_awq",
+    "hqq_quantize_weight",
+    "apply_hqq",
+    "sinq_quantize_weight",
+    "apply_sinq",
 ]
