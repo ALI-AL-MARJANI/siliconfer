@@ -9,6 +9,7 @@ from typing import Callable
 import mlx.core as mx
 
 from siliconfer.model.llama import LlamaModel
+from siliconfer.model.kv_cache import make_quantized_cache
 
 
 @dataclass
@@ -92,6 +93,7 @@ def generate(
     eos_token_id: int | None = None,
     stream: bool = False,
     on_token: Callable[[int], None] | None = None,
+    quantize_kv_cache: bool = False,
 ) -> GenerationResult:
     if params is None:
         params = SamplingParams()
@@ -102,8 +104,10 @@ def generate(
     B, T = prompt_ids.shape
     generated_ids: list[int] = []
 
+    cache = make_quantized_cache(len(model.layers)) if quantize_kv_cache else None
+
     t0 = time.perf_counter()
-    logits, cache = model(prompt_ids)
+    logits, cache = model(prompt_ids, cache)
     mx.eval(logits)
     t_prefill = time.perf_counter()
 
