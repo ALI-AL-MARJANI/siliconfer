@@ -1,44 +1,21 @@
-"""Mixed 2-bit/4-bit precision quantization, CoopQ-inspired.
+"""Mixed-precision quantization: per-block bit-widths chosen by Shapley sensitivity.
 
-Reference: Zhao, Derakhshan, Hyman, Dong, Abdu Jyothi, Harris — "CoopQ:
-Cooperative Game Inspired Layerwise Mixed Precision Quantization for LLMs"
-(arXiv:2509.15455, formerly "IMPQ"). Confirmed real (fact-checked via live web
-search, not assumed from a secondhand description): frames per-layer bit-width
-assignment as a cooperative game among layers and uses a Shapley-value-based
-sensitivity estimate to decide which layers can tolerate aggressive (2-bit)
-quantization vs which need to stay at 4-bit. No public code exists for CoopQ
-(confirmed absent on the authors' GitHub and via the arXiv listing) — this is
-an independent, from-scratch reimplementation of the *mechanism* the paper
-describes, not a port of anything, and it should be read with that in mind:
-the general Shapley-estimator below is standard game theory (exact,
-well-understood), but the specific choices of value function and assignment
-rule are this codebase's own design, informed by but not copied from CoopQ.
+Inspired by CoopQ (Zhao et al., arXiv:2509.15455), which frames bit-width
+assignment as a cooperative game among layers. No reference code is public;
+the value function and the assignment rule here are this project's own.
 
-Two independent pieces:
+1. `shapley_layer_sensitivity`: permutation-sampling Monte Carlo estimate of
+   each block's Shapley value under an arbitrary `value_fn(coalition)`
+   (Castro et al. 2009). Checked against closed-form values in
+   tests/test_mixed_precision.py.
 
-1. `shapley_layer_sensitivity` — a generic permutation-sampling Monte Carlo
-   Shapley value estimator. Domain-agnostic: given any `value_fn(coalition)`,
-   it estimates how much each of n_layers "players" contributes on average
-   across all possible join orders. This is the textbook exact estimator for
-   Shapley values (converges to the true value as n_permutations grows; see
-   `test_shapley_additive_value_function_exact` and
-   `test_shapley_matches_closed_form_pairwise_game` in test_mixed_precision.py
-   for closed-form ground-truth checks), not a novel approximation.
+2. `assign_bitwidths`: demote the least sensitive blocks until a memory
+   budget is met. Every block has the same parameter count in this
+   architecture, so the knapsack reduces to a top-k selection and the greedy
+   rule is exact. That stops holding at per-projection granularity, where
+   sizes differ.
 
-2. `assign_bitwidths` — a greedy demotion rule: rank layers by estimated
-   sensitivity, demote the least-sensitive ones from 4-bit to 2-bit until a
-   memory budget is met. This reduces to an *exactly optimal* top-k selection
-   specifically because every Llama-style transformer block in this codebase
-   has an identical parameter count (uniform hidden_size/intermediate_size
-   across depth) — so "bytes saved by demoting" is the same constant for
-   every block, and the general 0/1-knapsack problem (NP-hard in general,
-   needs DP or approximation when item sizes vary) collapses to picking the
-   k lowest-sensitivity items, which greedy-by-sensitivity solves exactly.
-   This equivalence is asserted, not just claimed — see
-   `test_assign_bitwidths_optimal_for_uniform_sizes` — and it would stop
-   holding if this were ever applied at a finer (per-projection-type)
-   granularity, where q/k/v/o and gate/up/down projections have different
-   sizes from each other (though all are still uniform *across depth*).
+Evaluated as fake-quant only: there is no 2-bit or 3-bit packed kernel.
 """
 
 from __future__ import annotations
@@ -46,7 +23,6 @@ from __future__ import annotations
 from typing import Callable
 
 import numpy as np
-
 
 # ---------------------------------------------------------------------------
 # 1. Generic permutation-sampling Shapley value estimator
@@ -58,31 +34,24 @@ def shapley_layer_sensitivity(
     n_permutations: int = 16,
     seed: int = 0,
 ) -> np.ndarray:
-    """Estimate each layer's Shapley value under `value_fn` via permutation sampling.
+    """Estimate each layer's Shapley value under `value_fn` by permutation sampling.
 
-    `value_fn(S)` must return a scalar "quality" for the coalition of layer
-    indices in S being in their BETTER state (e.g. 4-bit or fp16), with every
-    layer NOT in S in its WORSE state (e.g. 2-bit). Higher is better.
-
-    For a random permutation order, the marginal contribution of adding layer
-    i to the coalition built so far is `value_fn(S + i) - value_fn(S)`.
-    Averaging this marginal over many random permutations converges to layer
-    i's exact Shapley value — this is the standard permutation-sampling
-    estimator (Castro et al. 2009), not a heuristic proxy for it.
+    `value_fn(S)` returns a quality score when the layers in S are in their
+    better state (e.g. 4-bit) and all others in their worse state (e.g. 2-bit).
+    For a random order, the marginal contribution of layer i is
+    `value_fn(S + i) - value_fn(S)`; its average over orders converges to the
+    Shapley value.
 
     Args:
-        value_fn: coalition -> quality score. Should be deterministic (or its
-            own noise averaged out some other way) since results are cached
-            per-coalition across permutations.
+        value_fn: coalition -> quality score. Should be deterministic: results
+            are cached per coalition.
         n_layers: number of players (e.g. transformer blocks).
-        n_permutations: number of random join orders to sample. More
-            permutations reduce variance; interaction-heavy value functions
-            need more than additive ones (see tests for both regimes).
+        n_permutations: number of random orders. Value functions with strong
+            interactions need more than additive ones.
         seed: RNG seed for the permutation sampling.
 
     Returns:
-        sensitivity: float64 array [n_layers]. Higher = more sensitive =
-            contributes more quality when in its better state = should be
+        sensitivity: float64 array [n_layers]. Higher means the layer should be
             kept at the higher bit-width.
     """
     if n_layers <= 0:
@@ -125,25 +94,22 @@ def assign_bitwidths(
     high_bits: int = 4,
     low_bits: int = 2,
 ) -> np.ndarray:
-    """Assign each layer high_bits or low_bits to fit a memory budget.
+    """Assign each layer `high_bits` or `low_bits` to fit a memory budget.
 
-    Demotes layers from `high_bits` to `low_bits` in ascending order of
-    `sensitivity` (least sensitive first) until the total packed footprint
-    fits `memory_budget_bytes`. See the module docstring for why this greedy
-    rule is exactly optimal here (uniform layer sizes), not just a heuristic.
+    Layers are demoted in ascending order of `sensitivity` until the total
+    packed footprint fits `memory_budget_bytes`. Exact for uniform layer sizes
+    (see the module docstring).
 
     Args:
-        sensitivity: float array [n_layers], from shapley_layer_sensitivity
-            (or any other per-layer importance score — higher = keep at
-            high_bits).
-        bytes_per_layer_at_high_bits: float array [n_layers], packed footprint
-            each layer would use at `high_bits`.
-        memory_budget_bytes: total footprint ceiling across all layers.
-        high_bits: bit-width for "sensitive" layers (default 4).
-        low_bits: bit-width for "demoted" layers (default 2).
+        sensitivity: float array [n_layers]; higher = keep at `high_bits`.
+        bytes_per_layer_at_high_bits: float array [n_layers], footprint of each
+            layer at `high_bits`.
+        memory_budget_bytes: total footprint ceiling.
+        high_bits: bit-width for sensitive layers (default 4).
+        low_bits: bit-width for demoted layers (default 2).
 
     Returns:
-        bits: int array [n_layers], each entry high_bits or low_bits.
+        bits: int array [n_layers], each entry `high_bits` or `low_bits`.
     """
     n = len(sensitivity)
     bytes_at_high = np.asarray(bytes_per_layer_at_high_bits, dtype=np.float64)
@@ -176,38 +142,28 @@ def make_block_nll_value_fn(
     high_bits: int = 4,
     low_bits: int = 2,
 ) -> Callable[[frozenset[int]], float]:
-    """Build a Shapley value_fn: negative mean cross-entropy of `model` on
-    `calib_input_ids`, when the transformer blocks in the coalition are
-    quantized to `high_bits` and every other block to `low_bits`.
+    """Build a Shapley `value_fn`: negative mean cross-entropy of `model` on
+    `calib_input_ids` when the blocks in the coalition are quantized to
+    `high_bits` and every other block to `low_bits`.
 
-    Each block's high_bits and low_bits quantized weights are precomputed
-    ONCE up front (2 * n_layers quantization passes total), since neither
-    depends on which coalition is being evaluated — only which of the two
-    fixed arrays a block uses for a given forward pass does. An earlier
-    version re-quantized every block from scratch inside every coalition
-    evaluation (O(n_layers) real quantization passes per coalition, i.e.
-    O(n_layers^2) total per permutation) — correct, but needlessly expensive;
-    confirmed via real-model timing (a 24-layer, 1-permutation run took
-    several minutes) before rewriting this to the precompute-once version.
+    Both versions of every block's weights are quantized once up front; a
+    coalition evaluation only selects which of the two each block uses.
 
     Args:
-        model: a loaded LlamaModel (fp16 weights, not yet quantized;
-            mutated in place — its weights are overwritten on every
-            value_fn call and left at whatever coalition was evaluated
-            last, so treat `model` as consumed by this value_fn afterward).
-        calib_input_ids: mx.array [n_seqs, seq_len] token ids for the value
-            function's forward pass. Keep this small (a few short sequences)
-            — one forward pass happens per distinct coalition sampled across
-            all permutations.
+        model: a loaded fp16 LlamaModel. Its weights are overwritten on every
+            call and left at the last coalition evaluated.
+        calib_input_ids: mx.array [n_seqs, seq_len]. Keep it small: one forward
+            pass runs per distinct coalition.
         group_size: quantization group size.
         high_bits: bit-width for coalition members.
         low_bits: bit-width for everyone else.
 
     Returns:
-        value_fn suitable for shapley_layer_sensitivity.
+        value_fn suitable for `shapley_layer_sensitivity`.
     """
     import mlx.core as mx
-    from siliconfer.quant.hqq import _hqq_weight, _DEFAULT_K_GRID
+
+    from siliconfer.quant.hqq import _DEFAULT_K_GRID, _hqq_weight
 
     proj_names = [
         ("self_attn", "q_proj"), ("self_attn", "k_proj"),
@@ -258,23 +214,12 @@ def apply_mixed_precision(
 ):
     """Quantize each transformer block to the bit-width in `bits_per_block`.
 
-    Both tiers use HQQ (`hqq_quantize_weight(..., bits=...)`) — its
-    outlier-aware robust-z-score clip search generalizes cleanly to any
-    bit-width (see hqq.py). An earlier version used plain asymmetric RTN for
-    the low_bits tier; validated against a real model and found
-    catastrophically lossy (PPL 500,000+ demoting ALL blocks uniformly, still
-    ~65x worse than fp16 even when only half the blocks were demoted under a
-    Shapley-guided selection) — RTN's raw min/max range at only 4 levels
-    (2-bit) has zero protection against a group's outliers dominating the
-    whole grid, the same failure mode HQQ's search was built to fix at 4-bit.
-    Which layers get demoted still matters a lot (a random or naive selection
-    would presumably do far worse than the Shapley estimate), but the
-    demoted-tier *algorithm* choice also matters, and RTN was not good enough.
+    Both tiers use `hqq_quantize_weight(..., bits=...)`.
 
     Args:
-        model: a loaded LlamaModel (modified in place, returned for convenience).
+        model: a loaded LlamaModel, modified in place.
         bits_per_block: sequence of length len(model.layers), each entry
-            high_bits or low_bits.
+            `high_bits` or `low_bits`.
         group_size: quantization group size.
         high_bits: bit-width for high-precision blocks (default 4).
         low_bits: bit-width for demoted blocks (default 2).
@@ -284,7 +229,8 @@ def apply_mixed_precision(
         The same model with mixed-precision weights.
     """
     import mlx.core as mx
-    from siliconfer.quant.hqq import _hqq_weight, _DEFAULT_K_GRID
+
+    from siliconfer.quant.hqq import _DEFAULT_K_GRID, _hqq_weight
 
     if len(bits_per_block) != len(model.layers):
         raise ValueError(

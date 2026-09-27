@@ -1,26 +1,23 @@
-"""Phase 6: Load a pretrained model and replace all attn/MLP linears with Q4Linear.
+"""Load a pretrained model, quantize it, and replace its projections with Q4Linear.
 
-Usage:
     from siliconfer.engine.q4_loader import load_q4_model
-    model, config = load_q4_model(model_dir, method="rtn")
+    model, config = load_q4_model(model_dir, method="gptq", backend="mlx")
 
-Supported methods: "rtn", "gptq", "awq", "hqq", "sinq". "mixed" (2/4-bit mixed
-precision, quant/mixed_precision.py) is deliberately NOT served here yet — see
-the ValueError in load_q4_model for why; use scripts/quantize.py --method
-mixed for algorithm-level PPL validation instead.
+Methods: "rtn", "gptq", "awq", "hqq", "sinq". Mixed precision is not served
+(there is no 2-bit or 3-bit packed kernel); use scripts/quantize.py for it.
 """
 
 from __future__ import annotations
 
 from pathlib import Path
 
-import numpy as np
 import mlx.core as mx
+import numpy as np
 
-from siliconfer.model.llama import LlamaModel
+from siliconfer.kernels.neon import pack_weights_asym, pack_weights_on_grid, pack_weights_sym
 from siliconfer.model.config import ModelConfig
+from siliconfer.model.llama import LlamaModel
 from siliconfer.model.q4_linear import Q4Linear
-from siliconfer.kernels.neon import pack_weights_sym, pack_weights_asym
 
 
 def _pack_and_replace_linears(
@@ -28,24 +25,28 @@ def _pack_and_replace_linears(
     group_size: int = 128,
     skip_layers: set[int] | None = None,
     pack_sym: bool = True,
+    backend: str = "neon",
 ) -> None:
-    """Replace every attn+MLP nn.Linear in the model with Q4Linear, in-place.
+    """Replace every attention and MLP nn.Linear with a Q4Linear, in place.
 
-    Reads the current .weight (which may be fake-quant after RTN/GPTQ/AWQ/HQQ) and
-    re-packs it into uint8 + float32 scales (+ zero-points if asymmetric). The
-    round-trip is lossless *only if `pack_sym` matches the grid the fake-quant
-    values are actually sitting on* — e.g. symmetric fake-quant (-8 is never
-    reached, see NOTES.md) re-packed symmetrically recovers the same values
-    exactly, but re-packing an asymmetric grid with the symmetric packer
-    silently corrupts it (this was a real bug: HQQ is always asymmetric and
-    was always re-packed symmetric before this parameter existed — see
-    CLAUDE.md §9 for the diagnosis).
+    Packing must use the grid the weight was quantized on (docs/packing.md).
+    Three cases:
+
+    - RTN, HQQ: the grid is re-derived from the fake-quantized weight, which is
+      exact as long as `pack_sym` matches how it was quantized.
+    - GPTQ: the grid is fixed before error feedback moves the weights, so it
+      cannot be re-derived. `apply_gptq` attaches `_q4_grid` / `_q4_w_q`, which
+      are packed with `pack_weights_on_grid`.
+    - AWQ, SINQ: the effective weight Q(W·diag(s))·diag(1/s) is not on a group
+      grid at all. They attach the grid-aligned weight and the input scale; the
+      former is packed and the latter is passed to Q4Linear.
 
     Args:
-        skip_layers: set of layer indices to leave in fp16 (mixed precision). E.g.,
-            {0, n_layers-1} keeps the first and last layers in fp16 for lower PPL.
-        pack_sym: whether the current weights are on a symmetric (True) or
-            asymmetric (False) int4 grid — must match how they were quantized.
+        skip_layers: layer indices to leave in fp16.
+        pack_sym: whether the weights are on a symmetric (True) or asymmetric
+            (False) grid.
+        backend: "neon" (CPU kernel) or "mlx" (GPU, MLX's quantized matmul on
+            the same codes).
     """
     for i, layer in enumerate(model.layers):
         if skip_layers and i in skip_layers:
@@ -71,15 +72,30 @@ def _pack_and_replace_linears(
                 # Too small to quantize (synthetic / tiny test models)
                 continue
 
-            W_np = np.array(lin.weight.astype(mx.float32))
+            # AWQ/SINQ: pack the grid-aligned weight; Q4Linear applies input_scale.
+            w_grid = getattr(lin, "_awq_w_grid", None)
+            input_scale = getattr(lin, "_awq_input_scale", None)
+            if w_grid is None:
+                w_grid = getattr(lin, "_sinq_w_grid", None)
+                input_scale = getattr(lin, "_sinq_input_scale", None)
+
+            W_np = w_grid if w_grid is not None else np.array(lin.weight.astype(mx.float32))
             bias = getattr(lin, "bias", None)
 
-            if pack_sym:
+            grid = getattr(lin, "_q4_grid", None)
+            if grid is not None:
+                # The quantizer fixed its grid before moving the weights (GPTQ):
+                # pack on that grid rather than re-deriving one from the weight.
+                scales, zeros = grid
+                packed = pack_weights_on_grid(lin._q4_w_q, scales, zeros, group_size=group_size)
+            elif pack_sym:
                 packed, scales = pack_weights_sym(W_np, group_size=group_size)
-                setattr(parent, name, Q4Linear(packed, scales, bias=bias, group_size=group_size))
+                zeros = None
             else:
                 packed, scales, zeros = pack_weights_asym(W_np, group_size=group_size)
-                setattr(parent, name, Q4Linear(packed, scales, zeros=zeros, bias=bias, group_size=group_size))
+            setattr(parent, name, Q4Linear(packed, scales, zeros=zeros, bias=bias,
+                                           group_size=group_size, input_scale=input_scale,
+                                           backend=backend))
 
 
 def load_q4_model(
@@ -90,26 +106,32 @@ def load_q4_model(
     calib_model_id: str | None = None,
     n_calib_seqs: int = 128,
     calib_len: int = 512,
+    calib_seed: int = 42,
+    awq_block_loss: bool = False,
+    awq_clip: bool = False,
     skip_layers: set[int] | None = None,
+    backend: str = "neon",
     verbose: bool = True,
 ) -> tuple[LlamaModel, ModelConfig]:
-    """Load a model from disk, quantize to int4, and return a kernel-backed model.
+    """Load a model from disk, quantize it to int4 and return it with packed layers.
 
     Args:
-        model_dir:      Path to HF model directory (safetensors + config.json).
-        method:         "rtn" | "gptq" | "awq" | "hqq" | "sinq" — quantization algorithm.
-        group_size:     int4 group size (64 or 128).
-        sym:            Symmetric quantization (True) or asymmetric (False).
-        calib_model_id: HF model ID for calibration tokenizer (GPTQ/AWQ only).
+        model_dir:      Hugging Face model directory (safetensors + config.json).
+        method:         "rtn" | "gptq" | "awq" | "hqq" | "sinq".
+        sym:            symmetric (True) or asymmetric (False) grid.
+        calib_model_id: model id for the calibration tokenizer (GPTQ/AWQ).
                         Defaults to the basename of model_dir.
-        n_calib_seqs:   Number of WikiText-2 calibration sequences (GPTQ/AWQ).
-        calib_len:      Sequence length per calibration sequence.
-        skip_layers:    Optional set of layer indices to keep in fp16 (mixed precision).
-                        E.g., skip_layers={0, 23} keeps first and last layers in fp16.
-        verbose:        Print progress messages.
+        n_calib_seqs:   number of calibration sequences (GPTQ/AWQ).
+        calib_len:      tokens per calibration sequence.
+        calib_seed:     seed for sampling the calibration sequences.
+        awq_block_loss: AWQ: score α on the enclosing block's output.
+        awq_clip:       AWQ: per-group weight clipping after scaling.
+        skip_layers:    layer indices to keep in fp16.
+        backend:        "neon" (CPU kernel) or "mlx" (GPU).
+        verbose:        print progress.
 
     Returns:
-        (model, config) — LlamaModel with all linear layers replaced by Q4Linear.
+        (model, config)
     """
     model_dir = Path(model_dir)
 
@@ -141,16 +163,9 @@ def load_q4_model(
 
     elif method == "mixed":
         raise ValueError(
-            "method='mixed' is not supported here yet: _pack_and_replace_linears/Q4Linear "
-            "only know how to pack a 4-bit (nibble) grid. Packing a 2-bit-quantized layer "
-            "through the 4-bit packer would silently re-fit new scale/zero values onto a "
-            "4-bit grid and store 4 bits per weight anyway — the exact same class of "
-            "silent-mismatch bug documented in CLAUDE.md §9 for asymmetric packing, just "
-            "for bit-width instead of symmetry. A real int2 packed kernel (2-bit "
-            "nibble-of-4 packing + NEON GEMV/GEMM) is required before 'mixed' can be "
-            "served through this path; use scripts/quantize.py --method mixed for the "
-            "algorithm-level PPL comparison in the meantime (matches how every other "
-            "method here was validated before its packed-kernel integration existed)."
+            "method='mixed' cannot be served: only a 4-bit packed format exists, so a "
+            "2-bit or 3-bit layer would be re-quantized and stored at 4 bits. "
+            "Use scripts/quantize.py --method mixed for fake-quant evaluation."
         )
 
     elif method in ("gptq", "awq"):
@@ -159,33 +174,33 @@ def load_q4_model(
             print(f"[q4_loader] Loading {n_calib_seqs} calibration sequences "
                   f"(model_id={mid}) ...")
         from siliconfer.quant.calibration import load_calibration_sequences
-        calib_seqs = load_calibration_sequences(mid, n_seqs=n_calib_seqs, seq_len=calib_len)
+        calib_seqs = load_calibration_sequences(mid, n_seqs=n_calib_seqs, seq_len=calib_len, seed=calib_seed)
 
         if method == "gptq":
             if verbose:
-                print(f"[q4_loader] Applying GPTQ-int4 ...")
+                print("[q4_loader] Applying GPTQ-int4 ...")
             from siliconfer.quant.gptq import apply_gptq
             apply_gptq(model, calib_seqs, group_size=group_size, sym=sym, verbose=verbose)
         else:
             if verbose:
-                print(f"[q4_loader] Applying AWQ-int4 ...")
+                print("[q4_loader] Applying AWQ-int4 ...")
             from siliconfer.quant.awq import apply_awq
             apply_awq(model, calib_seqs, group_size=group_size, sym=sym,
-                      fold_scales=False, verbose=verbose)
+                      fold_scales=False, block_loss=awq_block_loss, auto_clip=awq_clip,
+                      verbose=verbose)
         mx.eval(model.parameters())
 
     else:
         raise ValueError(f"Unknown method {method!r}. Choose 'rtn', 'gptq', 'awq', 'hqq', or 'sinq'.")
 
-    # HQQ has no `sym` concept at all — it's always asymmetric (see quant/hqq.py's
-    # module docstring: the whole mechanism is fitting a zero-point). Every other
-    # method's packing symmetry follows the `sym` flag actually used to fake-quantize.
+    # HQQ is always asymmetric; the other methods follow `sym`.
     pack_sym = False if method == "hqq" else sym
 
     if verbose:
         print(f"[q4_loader] Packing int4 weights and replacing linear layers "
               f"({'symmetric' if pack_sym else 'asymmetric'}) ...")
-    _pack_and_replace_linears(model, group_size=group_size, skip_layers=skip_layers, pack_sym=pack_sym)
+    _pack_and_replace_linears(model, group_size=group_size, skip_layers=skip_layers,
+                              pack_sym=pack_sym, backend=backend)
 
     if verbose:
         _report_memory(model)
@@ -204,9 +219,7 @@ def _report_memory(model: LlamaModel) -> None:
                 lin = getattr(parent, name, None)
                 if isinstance(lin, Q4Linear):
                     # packed weights + scales (+ zeros if asymmetric)
-                    total_bytes += lin._packed.nbytes + lin._scales.nbytes
-                    if lin._zeros is not None:
-                        total_bytes += lin._zeros.nbytes
+                    total_bytes += lin.nbytes
                     n_q4 += 1
     print(f"[q4_loader] Replaced {n_q4} linear layers with Q4Linear. "
           f"Packed weight footprint: {total_bytes / 1e6:.1f} MB")

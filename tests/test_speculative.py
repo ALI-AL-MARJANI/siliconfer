@@ -1,4 +1,4 @@
-"""Phase 8 tests: mixed precision + speculative decoding.
+"""Tests: mixed precision + speculative decoding.
 
 All tests use the same tiny synthetic LlamaModel as test_integration.py
 (hidden=64, 2 layers, vocab=256) — no model download needed.
@@ -6,17 +6,16 @@ All tests use the same tiny synthetic LlamaModel as test_integration.py
 
 from __future__ import annotations
 
+import mlx.core as mx
 import numpy as np
 import pytest
-import mlx.core as mx
 
+from siliconfer.engine.generate import SamplingParams, generate
+from siliconfer.engine.q4_loader import _pack_and_replace_linears
+from siliconfer.engine.speculative import SpeculativeResult, speculative_generate
 from siliconfer.model.config import ModelConfig
 from siliconfer.model.llama import LlamaModel
 from siliconfer.model.q4_linear import Q4Linear
-from siliconfer.engine.q4_loader import _pack_and_replace_linears
-from siliconfer.engine.generate import generate, SamplingParams
-from siliconfer.engine.speculative import speculative_generate, SpeculativeResult
-
 
 # ---------------------------------------------------------------------------
 # Shared fixture: tiny synthetic model
@@ -123,10 +122,9 @@ class TestMixedPrecision:
 
 class TestSpeculativeDecoding:
     def _same_model_spec(self, K: int, max_tokens: int, seed: int = 42):
-        """Run speculative_generate with draft = target (same model instance).
+        """Run speculative_generate with draft = target.
 
-        When draft == target, every draft token is produced by the same distribution
-        as the target. With greedy (temp=0), argmax always matches → acceptance = 1.0.
+        With greedy decoding the argmaxes always agree, so acceptance is 1.0.
         """
         model = _make_tiny_model(seed=0)
         params = SamplingParams(temperature=0.0, max_tokens=max_tokens)
@@ -225,25 +223,18 @@ class TestSpeculativeDecoding:
 
 
 # ---------------------------------------------------------------------------
-# Phase 9d research note: naive multi-candidate retry is provably NOT lossless
+# Independent multi-candidate retries are not lossless
 # ---------------------------------------------------------------------------
 #
-# Documents (and tests, so it can't silently regress into being "fixed" and
-# reintroduced without noticing the flaw) a rejected design: after a drafted
-# token is rejected, resample fresh i.i.d. candidates from p_draft and retry
-# the same accept/reject test before falling back to residual sampling. The
-# relative win-probabilities among candidates don't depend on the retry
-# count (provable), but the residual/fallback distribution required to keep
-# the *overall* marginal equal to p_target does — and for retry count >= 2 it
-# can require a NEGATIVE probability for some tokens, which is impossible.
-# This is exactly why real tree-attention speculative decoding (SpecInfer,
-# EAGLE-2) needs careful correlated multi-candidate verification instead.
+# After a rejection, retrying the same position with fresh independent draft
+# samples would need a fallback distribution with negative entries for
+# retry counts >= 2. See docs/speculative.md.
 
 def test_naive_multicandidate_retry_requires_negative_fallback_probability():
-    """Algebraic proof that naive independent-retry is not a valid scheme:
-    for retry count M=2, the fallback distribution required to keep the
-    overall marginal equal to p_target has a negative entry whenever
-    p_draft(v) >= p_target(v) for some v (with Z small enough)."""
+    """Independent retries are not lossless: for M = 2 the fallback distribution
+    needed to keep the marginal equal to p_target has a negative entry whenever
+    p_draft(v) >= p_target(v) for some v. See docs/speculative.md.
+    """
     rng = np.random.default_rng(0)
     vocab = 10
     p_draft = rng.dirichlet(np.ones(vocab) * 2.0)
@@ -257,13 +248,13 @@ def test_naive_multicandidate_retry_requires_negative_fallback_probability():
     assert required_fallback_numerator.min() < 0.0, (
         "expected the naive scheme's required fallback distribution to be "
         "invalid (negative) for M=2 retries — if this now passes, the "
-        "surrounding claim in speculative.py's Phase 9d research note needs "
+        "surrounding claim in speculative.py's research note needs "
         "re-examination, not silent removal"
     )
 
 
 # ---------------------------------------------------------------------------
-# Phase 9d: dynamic speculation depth (the feature actually shipped)
+# Dynamic speculation depth
 # ---------------------------------------------------------------------------
 
 class TestDynamicK:
@@ -310,10 +301,10 @@ class TestDynamicK:
         assert avg_k > 1.5, f"expected K to have grown from 1, got avg_k={avg_k}"
 
     def test_k_shrinks_on_rejection(self):
-        """With genuinely different draft/target models and stochastic
-        sampling (rejections expected — greedy argmax coincidentally agrees
-        too often between these tiny synthetic models to exercise this path),
-        K should be pulled back toward K_min after a round that rejects early."""
+        """With different draft and target models and temperature > 0, rejections
+        occur and K is pulled back toward K_min. (Greedy decoding agrees too often
+        between these tiny models to exercise the path.)
+        """
         draft_model = _make_tiny_model(seed=11)
         target_model = _make_tiny_model(seed=99)
         params = SamplingParams(temperature=0.8, max_tokens=40)
@@ -327,8 +318,8 @@ class TestDynamicK:
         assert avg_k < 6.0, f"expected K to shrink below K_max at some point, got avg_k={avg_k}"
 
     def test_runs_end_to_end_with_different_draft_and_target(self):
-        """Smoke test: genuinely different draft/target models, temperature>0,
-        dynamic_K enabled — the realistic scenario this feature targets."""
+        """Smoke test: different draft and target models, temperature > 0,
+        dynamic_K enabled."""
         draft_model = _make_tiny_model(seed=11)
         target_model = _make_tiny_model(seed=22)
         params = SamplingParams(temperature=0.8, max_tokens=10)
@@ -355,17 +346,16 @@ class TestDynamicK:
 
 
 # ---------------------------------------------------------------------------
-# quantize_kv_cache integration (extends Phase 9b's QuantizedKVCache, which
+# quantize_kv_cache integration (extends QuantizedKVCache, which
 # Attention.__call__/_trim_cache already handled transparently, into the
 # speculative decoding loop)
 # ---------------------------------------------------------------------------
 
 class TestQuantizedKVCacheSpeculative:
     def test_greedy_matches_non_speculative_quantized_cache_generation(self):
-        """With quantize_kv_cache=True, speculative decoding must exactly
-        match *non-speculative generation from the same quantized-cache
-        model* — not the fp16-cache model's output, since quantized-cache
-        decoding is itself only an approximation of fp16 (Phase 9b)."""
+        """With an int8 KV cache, speculative decoding matches non-speculative
+        generation with the same quantized cache.
+        """
         model = _make_tiny_model(seed=7)
         params = SamplingParams(temperature=0.0, max_tokens=10)
         prompt = _prompt(6)
@@ -401,8 +391,8 @@ class TestQuantizedKVCacheSpeculative:
         assert res.acceptance_rate == pytest.approx(1.0, abs=0.01)
 
     def test_runs_end_to_end_with_different_draft_and_target(self):
-        """Smoke test: genuinely different draft/target models, temperature>0,
-        quantize_kv_cache=True — the realistic scenario this feature targets."""
+        """Smoke test: different draft and target models, temperature > 0,
+        int8 KV cache."""
         draft_model = _make_tiny_model(seed=11)
         target_model = _make_tiny_model(seed=22)
         params = SamplingParams(temperature=0.8, max_tokens=10)

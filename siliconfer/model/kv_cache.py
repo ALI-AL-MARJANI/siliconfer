@@ -1,41 +1,16 @@
-"""Group-wise int8 quantized KV cache (Phase 9b).
+"""int8-quantized KV cache.
 
-Reference lineage: KIVI (arXiv:2402.02750), KVQuant — group-wise quantization
-of the KV cache to curb its otherwise-unbounded memory growth with context
-length. This is the same "int4 keeps quality ≈ fp16, cuts memory" thesis
-already proven for weights in Phases 2-4, applied to the *cache* instead.
+Related work: KIVI (arXiv:2402.02750), KVQuant.
 
-Design choices (why int8, not int4, and why native MLX ops):
-
-- **int8, not int4.** Each key/value vector (length `head_dim`, typically
-  64/128) is quantized as a *single group* — there's no natural sub-grouping
-  to pack 2 int4 values per byte the way weight quantization does (that
-  packing exploits contiguous *rows* of many groups; a KV vector only has
-  one). int4 here would mean 4-bit codes stored one per byte anyway (no
-  packing win) while roughly doubling quantization error over int8 for a
-  much smaller cache that's already far more error-sensitive than weights
-  (it feeds directly into softmax). int8 gives a real ~2x memory reduction
-  (1 byte/value + a small per-vector float32 scale vs 2 bytes/value fp16)
-  with much safer accuracy — matching the conservative default chosen for
-  HQQ after the Phase 9a "super weight" incident. Packed int4 KV cache is a
-  possible future extension once a fused kernel (Phase 9c) can dequantize it
-  inline instead of materializing a full-precision copy every attention call.
-- **Native `mx.array` ops throughout, no numpy round-trip.** Weight
-  quantization (Phase 2-4) uses numpy, which is fine — it runs once, offline,
-  before serving starts. The KV cache is quantized *on every decode step, for
-  every layer*, so a numpy round-trip here would reproduce Phase 6's
-  documented CPU<->GPU sync bottleneck, except worse (per-token, not
-  per-model-load). Everything below — abs/max reduction, round, clip, the
-  cache's growing concatenation — stays as `mx.array` ops, so the cache never
-  leaves the compute graph.
-- **Dequantize-on-read, not a fused kernel.** `mx.fast.scaled_dot_product_attention`
-  has no quantized-KV variant (confirmed: MLX has no first-class primitive for
-  this as of this writing). So each attention call dequantizes the *whole*
-  accumulated cache back to float before running standard SDPA. This wastes
-  some redundant dequant work on already-seen tokens (real compute-speed
-  parity needs a fused kernel — see kernels/metal, Phase 9c) but is correct,
-  simple, and already delivers the memory-footprint win, which is what this
-  phase targets.
+- int8 rather than int4. Each key/value vector (length head_dim) is one
+  quantization group with one scale. There is no row of groups to pack
+  nibbles along, and attention scores are more sensitive to error than
+  weights are.
+- MLX ops only. The cache is quantized on every decode step for every
+  layer; a NumPy round trip would force a GPU↔CPU synchronisation per token.
+- Dequantize on read. Each attention call dequantizes the accumulated cache
+  and runs standard attention. That gives the memory saving; avoiding the
+  repeated dequantization needs the fused kernel in kernels/metal.
 """
 
 from __future__ import annotations
@@ -69,12 +44,10 @@ def dequantize_kv(q: mx.array, scale: mx.array, dtype: mx.Dtype = mx.float16) ->
 
 
 class QuantizedKVCache:
-    """Per-layer KV cache stored as packed int8 codes + per-vector scales.
+    """Per-layer KV cache stored as int8 codes plus one scale per vector.
 
-    Grows via `update()` exactly like the plain (k, v) tuple cache used
-    elsewhere in the engine, but the *stored* representation between calls is
-    the compressed one — the memory savings persist across the whole
-    generation loop, not just inside a single attention call.
+    Grows through `update()` like the plain (k, v) tuple cache; the stored
+    representation between calls is the compressed one.
     """
 
     def __init__(self) -> None:

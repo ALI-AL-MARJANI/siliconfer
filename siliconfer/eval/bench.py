@@ -4,20 +4,16 @@ Measures:
   - Prefill tok/s and decode tok/s for a given model
   - Weight memory footprint (MLX parameters + Q4Linear packed arrays)
 
-Used by scripts/run_benchmarks.py to produce the Phase 7 results table.
+Used by scripts/bench_decode.py.
 """
 
 from __future__ import annotations
 
-import time
-from typing import Any
-
-import numpy as np
 import mlx.core as mx
+import numpy as np
 
+from siliconfer.engine.generate import SamplingParams, generate
 from siliconfer.model.llama import LlamaModel
-from siliconfer.engine.generate import generate, SamplingParams
-
 
 # ---------------------------------------------------------------------------
 # Throughput
@@ -29,19 +25,18 @@ def measure_throughput(
     n_decode_tokens: int = 100,
     n_runs: int = 3,
 ) -> dict[str, float]:
-    """Measure prefill and decode throughput (tok/s).
+    """Measure prefill and decode throughput in tokens per second.
 
-    Runs generate() n_runs times and returns the median decode tok/s to reduce
-    JIT warm-up noise. Prefill is measured from the first run (one-shot).
+    Runs generate() once as a warm-up, then n_runs times; returns medians.
 
     Args:
-        model:            The model to benchmark (fp16 or Q4Linear).
-        prompt_ids:       Token IDs, shape [1, T].
-        n_decode_tokens:  Number of decode tokens to generate per run.
-        n_runs:           Number of independent runs; median is returned.
+        model:            the model to benchmark.
+        prompt_ids:       token ids, shape [1, T].
+        n_decode_tokens:  tokens generated per run.
+        n_runs:           number of timed runs.
 
     Returns:
-        dict with keys: prefill_tok_s, decode_tok_s, prefill_time_s, decode_time_s.
+        dict with prefill_tok_s, decode_tok_s, prefill_time_s, decode_time_s.
     """
     params = SamplingParams(temperature=0.0, max_tokens=n_decode_tokens)
 
@@ -95,7 +90,7 @@ def measure_memory(model: LlamaModel) -> dict[str, float]:
         return 0
     mlx_bytes = _visit(model.parameters())
 
-    # Q4Linear packed arrays (numpy, not tracked by MLX)
+    # Q4Linear packed arrays (not part of the MLX parameter tree)
     q4_bytes = 0
     for layer in model.layers:
         for parent in (layer.self_attn, layer.mlp):
@@ -103,9 +98,7 @@ def measure_memory(model: LlamaModel) -> dict[str, float]:
                          "gate_proj", "up_proj", "down_proj"):
                 lin = getattr(parent, name, None)
                 if isinstance(lin, Q4Linear):
-                    q4_bytes += lin._packed.nbytes + lin._scales.nbytes
-                    if lin._zeros is not None:
-                        q4_bytes += lin._zeros.nbytes
+                    q4_bytes += lin.nbytes
 
     return {
         "mlx_param_mb": mlx_bytes / 1e6,
@@ -115,24 +108,19 @@ def measure_memory(model: LlamaModel) -> dict[str, float]:
 
 
 # ---------------------------------------------------------------------------
-# KV-cache memory (Phase 9b)
+# KV-cache memory
 # ---------------------------------------------------------------------------
 
 def measure_kv_cache_memory(config, seq_len: int, batch: int = 1) -> dict[str, float]:
-    """Analytical KV-cache memory footprint at a given context length.
-
-    No generation is run — this is a closed-form size calculation (mirrors
-    how weight-quantization group overhead is accounted for in NOTES.md),
-    since the cache's byte count is a deterministic function of the config
-    and sequence length, not something that needs to be measured empirically.
+    """KV-cache size at a given context length, computed from the model shape.
 
     Args:
-        config: ModelConfig (needs num_hidden_layers, num_key_value_heads, head_dim).
-        seq_len: number of cached KV positions.
+        config: ModelConfig.
+        seq_len: number of cached positions.
         batch: batch size.
 
     Returns:
-        dict with keys: fp16_mb, int8_mb, compression.
+        dict with fp16_mb, int8_mb, compression.
     """
     n_layers = config.num_hidden_layers
     n_kv_heads = config.num_key_value_heads

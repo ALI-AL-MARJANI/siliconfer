@@ -7,12 +7,11 @@ the input at each linear projection.
 
 from __future__ import annotations
 
-import numpy as np
 import mlx.core as mx
 import mlx.nn as nn
+import numpy as np
 
 from siliconfer.model.layers import apply_rope
-
 
 # ---------------------------------------------------------------------------
 # Calibration sequence loading

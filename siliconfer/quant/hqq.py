@@ -1,73 +1,34 @@
-"""HQQ from scratch: Half-Quadratic Quantization (calibration-free).
+"""HQQ-style quantization: calibration-free clip-range search under an L_p loss.
 
-Reference: Badri & Shaji, "Half-Quadratic Quantization of Large Machine
-Learning Models" (Mobius Labs, 2023). https://mobiusml.github.io/hqq_blog/
+Named after Half-Quadratic Quantization (Badri & Shaji, Mobius Labs, 2023,
+https://mobiusml.github.io/hqq_blog/). HQQ fits the quantization parameters
+by a half-quadratic iteration on an L_p reconstruction loss with p < 1.
+This module keeps that objective and replaces the solver with a candidate
+search, so it is not the HQQ algorithm.
 
-Core idea: standard asymmetric RTN picks scale/zero from the group's exact
-min/max, so a single extreme outlier stretches the whole grid and starves
-resolution for every other weight in the group. HQQ instead treats the
-reconstruction error as hyper-Laplacian (heavy-tailed, i.e. tolerant of a few
-large errors) and fits scale/zero under an L_p loss with p<1 — which prefers
-clipping a handful of outliers over stretching the grid to include them, if
-that buys much finer resolution for the bulk of the group. No calibration
-activations are used — this only touches the weight tensor, unlike GPTQ/AWQ.
+For each (row, group):
 
-Implementation note (deviation from the original paper): Mobius Labs' solver
-treats the zero-point as a continuous half-quadratic optimization variable
-with a closed-form shrinkage update. We instead solve the *same* variational
-problem — "which (scale, zero) minimizes the group's L_p reconstruction
-loss under real round+clip quantization" — via a direct, from-scratch
-equivalent: a grid search over candidate clip ranges, evaluating the
-*actual* quantized (round + clip + dequant) L_p loss for each candidate and
-keeping the best.
+    m, d = median(w), 1.4826 · MAD(w)
+    for k in k_grid:                      # None = plain min/max (RTN)
+        clip w to [m − k·d, m + k·d]; quantize asymmetrically; dequantize
+        loss_k = Σ |w − ŵ|^p
+    keep the candidate with the smallest loss
 
-A first version of this search picked candidates by trimming a fixed
-*fraction* of elements from each tail (e.g. "drop the top/bottom 5%").
-Empirically, on real Qwen2.5-0.5B weight matrices, this was too aggressive:
-minimizing the raw mean L_p (p<1) loss unconstrained will happily clip a
-chunk of the *ordinary* sample tail — not real outliers — because
-`|error|^p` heavily discounts large errors, so shrinking the scale for the
-bulk "pays for itself" under the L_p metric even when it clearly hurts MSE
-and (empirically measured) downstream perplexity. Real weight tensors from a
-trained model rarely have pathological per-element outliers the way the
-motivating hyper-Laplacian story assumes; naive Lp-loss minimization treats
-their ordinary tail as if it were outliers to discard.
+The untrimmed candidate is always included, so the result is never worse
+than asymmetric RTN under the L_p loss.
 
-The fix: gate candidate clip ranges on genuine statistical outlier-ness via
-a robust z-score (distance from the group median in units of the
-median-absolute-deviation, MAD, scaled by 1.4826 to be a consistent
-estimator of the standard deviation under normality). Candidates only clip
-elements that are >= k MAD from the median, for k in a fixed descending
-grid; the loosest candidate (k=∞) is exactly the untrimmed min-max range,
-i.e. plain RTN — guaranteeing HQQ's L_p loss is never worse than RTN's by
-construction, while only engaging real clipping when a group actually
-contains elements far enough from its own center to look like true outliers.
-
-A second, more serious finding while validating against real Qwen2.5-0.5B
-weights: trained models can contain lone "super weight" outliers (see Yu et
-al., "The Super Weight in Large Language Models," 2024) — single elements
-with an extreme robust z-score (58, empirically, in one down_proj group of
-this model) that are nonetheless structurally critical: clipping that one
-value corrupts a residual-stream channel enough to blow up the whole
-forward pass (verified: WikiText-2 PPL went from ~26 to 400+ with a
-moderately aggressive k grid). Magnitude statistics computed on weights
-alone cannot tell a "safe to compress" heavy tail apart from a lone critical
-outlier — that distinction requires sensitivity information (a Hessian, like
-GPTQ, or activation magnitudes, like AWQ), which calibration-free HQQ does
-not have by design. Since real weight matrices also showed *negligible*
-benefit from clipping in the first place (0.99x-1.13x RTN's MSE, i.e. within
-noise), the responsible default keeps `k_grid` conservative enough that no
-realistic super-weight gets caught: the mechanism is still fully exercised
-and verified correct by the unit tests (which use unambiguous synthetic
-outliers, deliberately scaled far beyond any plausible real super-weight's
-z-score), but in practice it now behaves as a safety net for truly
-pathological data rather than a lever expected to move real model PPL.
+The default thresholds are deliberately large. A reconstruction loss on
+weights alone cannot tell a harmless outlier from a structurally important
+one ("super weights", Yu et al., arXiv:2411.07191), and clipping the latter
+breaks the model. With the default grid the method behaves like asymmetric
+RTN on almost every group; README results show the two are equivalent on
+Qwen2.5-0.5B.
 """
 
 from __future__ import annotations
 
-import numpy as np
 import mlx.core as mx
+import numpy as np
 
 from siliconfer.model.llama import LlamaModel
 
@@ -88,30 +49,21 @@ def hqq_quantize_weight(
     k_grid: tuple[float | None, ...] = _DEFAULT_K_GRID,
     bits: int = 4,
 ) -> np.ndarray:
-    """Quantize a weight matrix with HQQ: asymmetric int-`bits`, robust L_p scale/zero fit.
+    """Quantize a weight matrix: asymmetric grid, clip range chosen by L_p loss.
 
     Args:
-        W: float32 array, shape [out_features, in_features].
-            in_features must be divisible by group_size (or < group_size, see below).
+        W: float32 [out_features, in_features]; in_features divisible by
+            group_size, or smaller than it.
         group_size: quantization group size (64 or 128).
-        p: exponent of the robust reconstruction loss (0 < p < 2). p=0.7 matches
-            the hyper-Laplacian prior used in the original HQQ paper; p=2 would
-            recover a plain least-squares criterion (no robustness benefit).
-        k_grid: candidate outlier thresholds, in units of the group's robust
-            z-score (distance from the median in scaled-MAD units). `None`
-            means "no clipping" (plain min-max, i.e. RTN) and is always
-            included so HQQ can never be worse than RTN under its own L_p
-            objective. Smaller k = more aggressive clipping considered.
-        bits: quantization bit-width (4 = original HQQ int4; 2 lets the same
-            outlier-aware search run at a 4-level grid — added for the
-            mixed-precision low-bit tier, see mixed_precision.py, where plain
-            RTN-int2 was found to be catastrophically lossy on a real model
-            (PPL 500K+) regardless of which layers it's applied to; HQQ's
-            robust clip-range search meaningfully narrows that gap by not
-            letting a handful of outliers dictate the whole 4-level grid).
+        p: exponent of the reconstruction loss (0 < p < 2). 0.7 follows HQQ;
+            2 is plain least squares.
+        k_grid: candidate clip thresholds in robust z-score units (distance from
+            the median in scaled-MAD units). None means no clipping. Smaller
+            values clip more.
+        bits: bit-width (4 by default; 2 and 3 are used by mixed_precision.py).
 
     Returns:
-        W_q: float32 array, same shape as W, fake-dequantized (quantize→dequantize).
+        W_q: float32, same shape as W, quantized then dequantized.
     """
     q_max = float(2 ** bits - 1)
     out_features, in_features = W.shape
@@ -147,8 +99,7 @@ def hqq_quantize_weight(
         q = np.clip(np.round(W_g / scale + zero), 0, q_max)
         recon = scale * (q - zero)
 
-        # The real, robust (L_p, p<1) reconstruction loss — computed on the
-        # actual clipped+rounded reconstruction, not a linearized surrogate.
+        # L_p loss of the clipped and rounded reconstruction.
         loss = ((np.abs(W_g - recon) + _EPS) ** p).mean(axis=-1, keepdims=True)   # [out, n_groups, 1]
 
         if best_loss is None:
@@ -208,23 +159,20 @@ def apply_hqq(
     bits: int = 4,
     verbose: bool = True,
 ) -> LlamaModel:
-    """Apply HQQ int-`bits` quantization to all attention + MLP projections.
+    """Apply the HQQ-style quantizer to all attention and MLP projections.
 
-    Unlike GPTQ/AWQ, HQQ needs no calibration data or forward passes — each
-    weight tensor is quantized independently and layers can be processed in
-    any order (no cascading).
+    No calibration data is needed; each weight is quantized independently.
 
     Args:
-        model: a loaded LlamaModel (modified in place, returned for convenience).
+        model: a loaded LlamaModel, modified in place.
         group_size: quantization group size (64 or 128).
-        p: robust loss exponent (0 < p < 2, default 0.7).
-        k_grid: candidate robust-z-score outlier thresholds (see hqq_quantize_weight).
-        bits: quantization bit-width (4 = default int4; 2 for the
-            mixed-precision low-bit tier, see mixed_precision.py).
+        p: loss exponent (0 < p < 2, default 0.7).
+        k_grid: candidate clip thresholds (see `hqq_quantize_weight`).
+        bits: quantization bit-width.
         verbose: print per-layer progress.
 
     Returns:
-        The same model with HQQ-quantized weights.
+        The same model with quantized weights.
     """
     n_layers = len(model.layers)
     for i, layer in enumerate(model.layers):

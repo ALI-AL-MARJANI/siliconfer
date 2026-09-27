@@ -7,14 +7,14 @@ from pathlib import Path
 import mlx.core as mx
 import mlx.nn as nn
 
+from siliconfer.engine.loader import load_model
 from siliconfer.model.config import ModelConfig
+from siliconfer.model.kv_cache import QuantizedKVCache
 from siliconfer.model.layers import (
     RMSNorm,
     TransformerBlock,
     _compute_rope_freqs,
 )
-from siliconfer.model.kv_cache import QuantizedKVCache
-from siliconfer.engine.loader import load_model, weight_summary
 
 
 class LlamaModel(nn.Module):
@@ -44,13 +44,10 @@ class LlamaModel(nn.Module):
         tuple[mx.array, list[tuple[mx.array, mx.array] | QuantizedKVCache]]
         | tuple[mx.array, list[tuple[mx.array, mx.array] | QuantizedKVCache], list[mx.array]]
     ):
-        """Forward pass. Returns (logits, cache) unless `feature_layers` is
-        given, in which case it returns (logits, cache, hidden_states) where
-        hidden_states[i] is this block's output for feature_layers[i] — added
-        for the EAGLE-3-style draft head (model/draft_head.py), which fuses
-        hidden states from a few chosen depths rather than only the final
-        layer. Backward compatible: omitting feature_layers keeps the
-        original 2-tuple return exactly as before.
+        """Forward pass. Returns (logits, cache).
+
+        With `feature_layers`, also returns the hidden states after those blocks:
+        (logits, cache, hidden_states). Used by the draft head.
         """
         x = self.embed_tokens(input_ids)
 
@@ -64,6 +61,12 @@ class LlamaModel(nn.Module):
                 by_layer[i] = x
 
         x = self.norm(x)
+
+        # Match the head's dtype. Quantized layers return float32; multiplying a
+        # float32 activation by the fp16 vocabulary matrix would re-cast that
+        # whole matrix (the largest tensor in a small model) on every token.
+        head_weight = self.lm_head.weight if self.lm_head is not None else self.embed_tokens.weight
+        x = x.astype(head_weight.dtype)
 
         if self.lm_head is not None:
             logits = self.lm_head(x)

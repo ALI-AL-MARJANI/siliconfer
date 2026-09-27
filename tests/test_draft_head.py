@@ -1,23 +1,20 @@
-"""Tests for the EAGLE-3-inspired FeatureFusionDraftHead (model/draft_head.py)
-and its supervised distillation training (engine/draft_training.py).
-
-Uses a tiny synthetic LlamaModel as the "target" — no model download needed.
+"""Tests for FeatureFusionDraftHead (model/draft_head.py) and its training
+(engine/draft_training.py), on a tiny synthetic target model.
 """
 
 from __future__ import annotations
 
-import numpy as np
 import mlx.core as mx
+import numpy as np
 
-from siliconfer.model.config import ModelConfig
-from siliconfer.model.llama import LlamaModel
-from siliconfer.model.draft_head import FeatureFusionDraftHead
 from siliconfer.engine.draft_training import (
     collect_distillation_example,
-    train_draft_head,
     evaluate_top1_accuracy,
+    train_draft_head,
 )
-
+from siliconfer.model.config import ModelConfig
+from siliconfer.model.draft_head import FeatureFusionDraftHead
+from siliconfer.model.llama import LlamaModel
 
 _TINY_CFG = dict(
     architectures=["LlamaForCausalLM"],
@@ -126,10 +123,9 @@ def test_draft_head_incremental_call_shape():
 
 
 def test_embed_tokens_and_lm_head_excluded_from_parameter_tree():
-    """The shared target embedding/LM head must NOT appear in the draft
-    head's own trainable parameter tree (leading-underscore attribute
-    convention) — otherwise the optimizer would silently update the
-    target's real embedding weights while "training the draft head"."""
+    """The shared embedding and output head must not be in the draft head's
+    parameter tree; otherwise training it would update the target's weights.
+    """
     target = _make_target()
     config = ModelConfig(**_TINY_CFG)
     head = FeatureFusionDraftHead(config, _FEATURE_LAYERS)
@@ -207,11 +203,9 @@ def test_train_draft_head_reports_best_epoch_and_val_loss():
 
 
 def test_train_draft_head_restores_best_checkpoint_not_final_epoch():
-    """If val_loss gets worse in later epochs, the parameters left on
-    draft_head after training must match the BEST epoch's snapshot, not
-    whatever the optimizer left after the final epoch — the real bug found
-    during the first real-model run (best val_loss was at epoch 28 of 40,
-    but the reported result used epoch 40's overfit weights)."""
+    """If the validation loss worsens in later epochs, the parameters left
+    after training are those of the best epoch, not the last one.
+    """
     target = _make_target(seed=20)
     config = ModelConfig(**_TINY_CFG)
     head = FeatureFusionDraftHead(config, _FEATURE_LAYERS)
@@ -241,10 +235,9 @@ def test_train_draft_head_restores_best_checkpoint_not_final_epoch():
 
 
 def test_train_draft_head_early_stopping_triggers():
-    """With patience=2 and enough epochs for val_loss to plateau/worsen, the
-    run should stop before n_epochs and report a best_epoch well before the
-    end — not silently run the full budget every time regardless of whether
-    it's still helping."""
+    """With patience=2 and a plateauing validation loss, training stops before
+    n_epochs and reports a best_epoch before the end.
+    """
     target = _make_target(seed=30)
     config = ModelConfig(**_TINY_CFG)
     head = FeatureFusionDraftHead(config, _FEATURE_LAYERS)

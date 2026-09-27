@@ -1,4 +1,4 @@
-"""Phase 0 smoke tests: import, config parsing, loader basics."""
+"""Smoke tests: import, config parsing, loader basics."""
 
 import json
 import tempfile
@@ -6,11 +6,10 @@ from pathlib import Path
 
 import mlx.core as mx
 import numpy as np
-import pytest
 
 import siliconfer
-from siliconfer.model.config import ModelConfig
 from siliconfer.engine.loader import load_model, weight_summary
+from siliconfer.model.config import ModelConfig
 
 
 def test_version():

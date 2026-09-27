@@ -1,23 +1,22 @@
-"""Phase 6 integration tests: Q4Linear + end-to-end model generation.
+"""Integration tests: Q4Linear + end-to-end model generation.
 
 Uses a tiny synthetic LlamaModel (hidden=64, 2 layers) — no model download needed.
 """
 
 from __future__ import annotations
 
+import mlx.core as mx
 import numpy as np
 import pytest
-import mlx.core as mx
-import mlx.nn as nn
 
+from siliconfer.engine.generate import SamplingParams, generate, warmup
+from siliconfer.engine.q4_loader import _pack_and_replace_linears
+from siliconfer.kernels.neon import pack_weights_asym, pack_weights_sym
 from siliconfer.model.config import ModelConfig
 from siliconfer.model.llama import LlamaModel
 from siliconfer.model.q4_linear import Q4Linear
-from siliconfer.engine.q4_loader import _pack_and_replace_linears
-from siliconfer.engine.generate import generate, warmup, SamplingParams
-from siliconfer.kernels.neon import pack_weights_sym, pack_weights_asym, gemv_sym
 from siliconfer.quant.primitives import fake_quantize
-
+from siliconfer.quant.rtn import apply_rtn
 
 # ---------------------------------------------------------------------------
 # Tiny synthetic model config
@@ -131,8 +130,7 @@ def test_q4linear_batch_and_seq():
 
 def test_q4linear_asym_matches_fake_quant():
     """Asymmetric Q4Linear (zeros != None) should match asymmetric fake_quantize
-    exactly the way the symmetric path already does — closes the gap documented
-    in CLAUDE.md §9 (Q4Linear had no zero-point storage at all before this)."""
+    exactly the way the symmetric path already does — see docs/packing.md."""
     rng = np.random.default_rng(4)
     out_f, in_f = 32, 64
     W = (rng.normal(0, 1, (out_f, in_f)) + 1.0).astype(np.float32)   # skewed, favors asym
@@ -169,6 +167,105 @@ def test_q4linear_asym_beats_sym_on_skewed_weights():
 
     assert not np.allclose(y_asym, y_sym, atol=1e-3), \
         "asymmetric and symmetric packing should diverge on skewed weights"
+
+
+def test_pack_and_replace_linears_awq_uses_grid_aligned_weight():
+    """End-to-end regression guard for the AWQ double-quantization bug:
+    _pack_and_replace_linears must pack the grid-aligned _awq_w_grid (via
+    input_scale), not re-quantize .weight (= W_eff, off-grid). Compares the
+    packed model's logits against the pre-pack fp32 (W_eff) model's logits —
+    they should match closely; before the fix they diverged substantially."""
+    from siliconfer.quant.awq import apply_awq
+
+    model = _make_tiny_model(seed=42)
+    rng = np.random.default_rng(42)
+    calib_seqs = [mx.array(rng.integers(0, _TINY_CFG["vocab_size"], (1, 32))) for _ in range(4)]
+
+    apply_awq(model, calib_seqs, group_size=_GROUP_SIZE, sym=True, n_alpha=10, verbose=False)
+
+    # Sanity: apply_awq must have attached the grid-aligned components.
+    q_proj = model.layers[0].self_attn.q_proj
+    assert hasattr(q_proj, "_awq_w_grid")
+    assert hasattr(q_proj, "_awq_input_scale")
+
+    input_ids = mx.array([[1, 2, 3, 4, 5]])
+    logits_before, _ = model(input_ids)
+    mx.eval(logits_before)
+
+    _pack_and_replace_linears(model, group_size=_GROUP_SIZE)
+    assert isinstance(model.layers[0].self_attn.q_proj, Q4Linear)
+    assert model.layers[0].self_attn.q_proj._input_scale is not None
+
+    logits_after, _ = model(input_ids)
+    mx.eval(logits_after)
+
+    np.testing.assert_allclose(
+        np.array(logits_before), np.array(logits_after), atol=1e-2, rtol=1e-2
+    )
+
+
+def test_awq_block_loss_and_clip_end_to_end():
+    """apply_awq with block-output α search and clipping: the search must leave
+    no trace on the weights it temporarily swaps, and the packed model must
+    still reproduce the pre-pack logits."""
+    from siliconfer.quant.awq import apply_awq
+
+    rng = np.random.default_rng(44)
+    calib_seqs = [mx.array(rng.integers(0, _TINY_CFG["vocab_size"], (1, 32))) for _ in range(4)]
+
+    # o_proj / down_proj are searched on their own output in both modes, so with
+    # clipping off their result must not depend on block_loss — which it would
+    # if the block search failed to restore the q/k/v or gate/up weights.
+    plain = _make_tiny_model(seed=44)
+    apply_awq(plain, calib_seqs, group_size=_GROUP_SIZE, n_alpha=10, verbose=False)
+    block = _make_tiny_model(seed=44)
+    apply_awq(block, calib_seqs, group_size=_GROUP_SIZE, n_alpha=10, block_loss=True,
+              n_loss_seqs=4, verbose=False)
+    np.testing.assert_array_equal(
+        plain.layers[0].self_attn.o_proj._awq_w_grid, block.layers[0].self_attn.o_proj._awq_w_grid
+    )
+
+    model = _make_tiny_model(seed=44)
+    apply_awq(model, calib_seqs, group_size=_GROUP_SIZE, n_alpha=10, block_loss=True,
+              auto_clip=True, n_loss_seqs=4, verbose=False)
+
+    input_ids = mx.array([[1, 2, 3, 4, 5]])
+    logits_before, _ = model(input_ids)
+    mx.eval(logits_before)
+    assert np.isfinite(np.array(logits_before)).all()
+
+    _pack_and_replace_linears(model, group_size=_GROUP_SIZE)
+    logits_after, _ = model(input_ids)
+    mx.eval(logits_after)
+    np.testing.assert_allclose(
+        np.array(logits_before), np.array(logits_after), atol=1e-2, rtol=1e-2
+    )
+
+
+def test_pack_and_replace_linears_sinq_uses_grid_aligned_weight():
+    """Same regression guard as the AWQ test above, for SINQ."""
+    from siliconfer.quant.sinq import apply_sinq
+
+    model = _make_tiny_model(seed=43)
+    apply_sinq(model, group_size=_GROUP_SIZE, sym=True, n_iters=5, verbose=False)
+
+    q_proj = model.layers[0].self_attn.q_proj
+    assert hasattr(q_proj, "_sinq_w_grid")
+    assert hasattr(q_proj, "_sinq_input_scale")
+
+    input_ids = mx.array([[1, 2, 3, 4, 5]])
+    logits_before, _ = model(input_ids)
+    mx.eval(logits_before)
+
+    _pack_and_replace_linears(model, group_size=_GROUP_SIZE)
+    assert model.layers[0].self_attn.q_proj._input_scale is not None
+
+    logits_after, _ = model(input_ids)
+    mx.eval(logits_after)
+
+    np.testing.assert_allclose(
+        np.array(logits_before), np.array(logits_after), atol=1e-2, rtol=1e-2
+    )
 
 
 def test_pack_and_replace_linears_asym_mode():
@@ -299,3 +396,95 @@ def test_warmup_with_quantized_kv_cache():
     model = _make_tiny_model(seed=4)
     _pack_and_replace_linears(model, group_size=_GROUP_SIZE)
     warmup(model, quantize_kv_cache=True)  # must not raise
+
+
+@pytest.mark.parametrize("sym", [True, False])
+def test_pack_and_replace_linears_gptq_packs_on_its_own_grid(sym):
+    """GPTQ fixes each group's grid from the original weight, then error
+    feedback moves the weights; the packed layer must hold exactly the weight
+    GPTQ produced, which requires packing on GPTQ's grid."""
+    from siliconfer.kernels.neon import dequant
+    from siliconfer.quant.gptq import apply_gptq
+
+    model = _make_tiny_model(seed=45)
+    rng = np.random.default_rng(45)
+    calib_seqs = [mx.array(rng.integers(0, _TINY_CFG["vocab_size"], (1, 32))) for _ in range(4)]
+    apply_gptq(model, calib_seqs, group_size=_GROUP_SIZE, sym=sym, verbose=False)
+
+    expected = {}
+    for i, layer in enumerate(model.layers):
+        for parent, name in ((layer.self_attn, "q_proj"), (layer.mlp, "down_proj")):
+            lin = getattr(parent, name)
+            assert hasattr(lin, "_q4_grid")
+            expected[(i, name)] = lin._q4_w_q
+
+    _pack_and_replace_linears(model, group_size=_GROUP_SIZE, pack_sym=sym)
+    for i, layer in enumerate(model.layers):
+        for parent, name in ((layer.self_attn, "q_proj"), (layer.mlp, "down_proj")):
+            lin = getattr(parent, name)
+            W_packed = dequant(lin._packed, lin._scales, lin._zeros, _GROUP_SIZE)
+            np.testing.assert_allclose(W_packed, expected[(i, name)], atol=1e-6, rtol=1e-6)
+
+
+# ---------------------------------------------------------------------------
+# MLX (GPU) backend: same codes, MLX's native quantized matmul
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("sym", [True, False])
+def test_to_mlx_quantized_is_lossless(sym):
+    """Re-expressing the packed codes in MLX's layout must not change one weight."""
+    from siliconfer.kernels.neon import dequant
+    from siliconfer.model.q4_linear import to_mlx_quantized
+
+    rng = np.random.default_rng(50)
+    W = rng.normal(0, 1, (12, 256)).astype(np.float32)
+    if sym:
+        packed, scales = pack_weights_sym(W, group_size=64)
+        zeros = None
+    else:
+        packed, scales, zeros = pack_weights_asym(W, group_size=64)
+
+    w, sc, b = to_mlx_quantized(packed, scales, zeros)
+    W_mlx = np.array(mx.dequantize(w, sc, b, group_size=64, bits=4))
+    np.testing.assert_allclose(W_mlx, dequant(packed, scales, zeros, 64), atol=1e-6, rtol=1e-6)
+
+
+@pytest.mark.parametrize("sym", [True, False])
+@pytest.mark.parametrize("T", [1, 5])
+def test_q4linear_mlx_backend_matches_neon(sym, T):
+    rng = np.random.default_rng(51)
+    out_f, in_f = 48, 128
+    W = rng.normal(0, 1, (out_f, in_f)).astype(np.float32)
+    bias = mx.array(rng.normal(0, 1, out_f).astype(np.float32))
+    input_scale = (np.abs(rng.normal(0, 1, in_f)) + 0.5).astype(np.float32)
+    if sym:
+        packed, scales = pack_weights_sym(W, group_size=64)
+        zeros = None
+    else:
+        packed, scales, zeros = pack_weights_asym(W, group_size=64)
+
+    kw = dict(zeros=zeros, bias=bias, group_size=64, input_scale=input_scale)
+    neon = Q4Linear(packed, scales, backend="neon", **kw)
+    gpu = Q4Linear(packed, scales, backend="mlx", **kw)
+
+    x = mx.array(rng.normal(0, 1, (1, T, in_f)).astype(np.float32))
+    y_neon, y_gpu = np.array(neon(x)), np.array(gpu(x))
+    assert y_gpu.shape == (1, T, out_f)
+    np.testing.assert_allclose(y_gpu, y_neon, atol=1e-3, rtol=1e-3)
+    assert gpu.nbytes == neon.nbytes + (0 if zeros is not None else scales.nbytes)
+    assert list(gpu.parameters().keys()) == ["bias"], "packed GPU arrays must stay out of the param tree"
+
+
+def test_pack_and_replace_linears_mlx_backend_matches_neon():
+    model_neon = _make_tiny_model(seed=52)
+    model_gpu = _make_tiny_model(seed=52)
+    apply_rtn(model_neon, group_size=_GROUP_SIZE)
+    apply_rtn(model_gpu, group_size=_GROUP_SIZE)
+    _pack_and_replace_linears(model_neon, group_size=_GROUP_SIZE, backend="neon")
+    _pack_and_replace_linears(model_gpu, group_size=_GROUP_SIZE, backend="mlx")
+    assert model_gpu.layers[0].mlp.gate_proj._backend == "mlx"
+
+    input_ids = mx.array([[1, 2, 3, 4, 5, 6]])
+    np.testing.assert_allclose(
+        np.array(model_gpu(input_ids)[0]), np.array(model_neon(input_ids)[0]), atol=1e-3, rtol=1e-3
+    )
