@@ -1,0 +1,61 @@
+{
+  "model_id": "Qwen/Qwen2.5-0.5B",
+  "protocol": "incremental decode, one token per forward pass, fp16 weights",
+  "n_segments": 8,
+  "segment_len": 512,
+  "n_tokens_scored": 4088,
+  "ppl_plain_cache": 17.879282847281736,
+  "ppl_int8_cache": 18.557598414005394,
+  "delta_ppl": 0.6783155667236578,
+  "delta_ppl_bootstrap_ci95": [
+    0.4664955780116139,
+    0.8615630922766933
+  ],
+  "per_segment_ppl_plain": [
+    12.036828374247813,
+    20.034865190030878,
+    20.603428042562385,
+    17.92851675142508,
+    15.42310211027763,
+    17.584919475251795,
+    19.972056880284814,
+    21.641308092546268
+  ],
+  "per_segment_ppl_int8": [
+    12.860055230032275,
+    20.975111492072607,
+    21.14459007053022,
+    18.12994529600393,
+    16.10565325573318,
+    17.878594309108546,
+    20.835596826599335,
+    22.673243070557003
+  ],
+  "per_segment_delta_mean": 0.6722205792513043,
+  "per_segment_delta_std": 0.3030472189157599,
+  "cache_memory_at_2048_tokens": {
+    "fp16_mb": 25.165824,
+    "int8_mb": 13.369344,
+    "compression": 1.8823529411764706
+  },
+  "elapsed_s": 128.5,
+  "env": {
+    "kernel_backend": "neon",
+    "kernel_threads": 4,
+    "date_utc": "2026-10-02T04:54:28.654642+00:00",
+    "git_sha": "9ee87099f7ee1ca6c154cbf99567b17402d3d36b",
+    "git_dirty": true,
+    "platform": "macOS-15.6.1-arm64-arm-64bit",
+    "python": "3.11.15",
+    "cpu": "Apple M4",
+    "memory_gb": 16.0,
+    "versions": {
+      "mlx": "0.31.2",
+      "numpy": "2.4.6",
+      "torch": "2.12.1",
+      "transformers": "5.12.1",
+      "datasets": "5.0.0",
+      "pybind11": "3.0.4"
+    }
+  }
+}
