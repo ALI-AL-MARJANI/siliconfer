@@ -12,20 +12,16 @@ Usage:
     # Use local model dir:
     python scripts/run.py --model_dir /path/to/model --prompt "Hello"
 
-    # Speculative decoding (Phase 8/9d) — draft model defaults to the same
-    # weights as the target if --draft_model_id/--draft_model_dir aren't
-    # given (a correctness demo, not a speed win, since draft=target means
-    # every draft token is exactly as expensive to verify as it was to
-    # propose — pass a genuinely smaller model sharing the same tokenizer
-    # for a real speedup):
+    # Speculative decoding. Without --draft_model_id/--draft_model_dir the
+    # draft is the target itself, which demonstrates correctness but cannot be
+    # faster; pass a smaller model with the same tokenizer for a speedup:
     python scripts/run.py --model_id Qwen/Qwen2.5-0.5B --speculative --K 4 \\
         --prompt "Explain attention in transformers:"
 
-    # Dynamic speculation depth (adapts K round-to-round, still exactly
-    # lossless — see CLAUDE.md §9d):
+    # Dynamic speculation depth (adapts K from round to round):
     python scripts/run.py --model_id Qwen/Qwen2.5-0.5B --speculative --dynamic_K
 
-    # Mixed precision (Phase 8): keep the first + last layers in fp16 for
+    # Mixed precision: keep the first + last layers in fp16 for
     # lower PPL at a small memory cost. --mixed_precision is shorthand for
     # --skip_layers with the first and last layer indices; pass --skip_layers
     # directly for manual control (e.g. "--skip_layers 0,1,22,23").
@@ -41,8 +37,8 @@ from pathlib import Path
 
 import mlx.core as mx
 
+from siliconfer.engine.generate import SamplingParams, generate, warmup
 from siliconfer.engine.q4_loader import load_q4_model
-from siliconfer.engine.generate import generate, warmup, SamplingParams
 from siliconfer.engine.speculative import speculative_generate
 from siliconfer.kernels.neon import NEON_AVAILABLE
 from siliconfer.model.config import ModelConfig
@@ -76,6 +72,9 @@ def main() -> None:
                         help="Quantization method (default: rtn).")
     parser.add_argument("--group_size", type=int, default=128)
     parser.add_argument("--asym",       action="store_true")
+    parser.add_argument("--backend",    default="neon", choices=["neon", "mlx"],
+                        help="Kernel for the int4 layers: 'neon' (this repo's CPU kernel) or "
+                             "'mlx' (same codes on the GPU via MLX's quantized matmul; faster decode).")
     parser.add_argument("--prompt",     default="The history of artificial intelligence began",
                         help="Text prompt.")
     parser.add_argument("--max_tokens", type=int, default=200)
@@ -86,25 +85,25 @@ def main() -> None:
                         help="Calibration sequences for GPTQ/AWQ.")
     parser.add_argument("--calib_len",  type=int, default=512)
     parser.add_argument("--quantize_kv_cache", action="store_true",
-                        help="Store the KV cache as group-wise int8 instead of fp16 (Phase 9b). "
+                        help="Store the KV cache as group-wise int8 instead of fp16. "
                              "Works with --speculative too (applies to both draft and target).")
     parser.add_argument("--speculative", action="store_true",
-                        help="Use speculative decoding (Phase 8/9d) instead of plain generation.")
+                        help="Use speculative decoding instead of plain generation.")
     parser.add_argument("--draft_model_id", default=None,
                         help="HF model ID for the draft model (speculative only). "
-                             "Defaults to --model_id/--model_dir (draft=target: a correctness "
-                             "demo, not a speed win — pass a real smaller model for that).")
+                             "Defaults to the target model, which demonstrates correctness "
+                             "but cannot be faster.")
     parser.add_argument("--draft_model_dir", default=None,
                         help="Local draft model directory (speculative only).")
     parser.add_argument("--K", type=int, default=4,
                         help="Speculation depth per round (speculative only).")
     parser.add_argument("--dynamic_K", action="store_true",
                         help="Adapt K round-to-round based on acceptance (speculative only). "
-                             "Exactly lossless by construction — see CLAUDE.md §9d.")
+                             "Exactly lossless by construction.")
     parser.add_argument("--K_min", type=int, default=1)
     parser.add_argument("--K_max", type=int, default=8)
     parser.add_argument("--mixed_precision", action="store_true",
-                        help="Keep the first + last transformer layers in fp16 (Phase 8's "
+                        help="Keep the first + last transformer layers in fp16 ("
                              "standard heuristic — those layers are most sensitive to "
                              "quantization). Shorthand for --skip_layers with those two "
                              "indices; --skip_layers overrides this if both are given.")
@@ -137,7 +136,7 @@ def main() -> None:
         skip_layers = {0, n_layers - 1}
 
     print(f"\n{'='*60}")
-    print(f" siliconfer — int4 inference on Apple Silicon")
+    print(" siliconfer — int4 inference on Apple Silicon")
     print(f"  method={args.method}  group_size={args.group_size}  "
           f"NEON={NEON_AVAILABLE}  kv_cache={'int8' if args.quantize_kv_cache else 'fp16'}")
     if skip_layers:
@@ -158,6 +157,7 @@ def main() -> None:
         n_calib_seqs=args.calib_seqs,
         calib_len=args.calib_len,
         skip_layers=skip_layers,
+        backend=args.backend,
         verbose=True,
     )
     load_sec = time.perf_counter() - t0
@@ -185,6 +185,7 @@ def main() -> None:
             n_calib_seqs=args.calib_seqs,
             calib_len=args.calib_len,
             skip_layers=skip_layers,
+            backend=args.backend,
             verbose=True,
         )
         print(f"[run] Draft model ready in {time.perf_counter()-t0:.1f}s\n")
@@ -248,7 +249,7 @@ def main() -> None:
 
     # ------------------------------------------------------------------ stats
     total_tokens = result.num_decode_tokens
-    print(f"\n[stats]")
+    print("\n[stats]")
     print(f"  prefill : {result.num_prefill_tokens} tok in "
           f"{result.prefill_time*1e3:.1f} ms  "
           f"({result.prefill_tok_s:.0f} tok/s)")
