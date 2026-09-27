@@ -1,8 +1,3 @@
-# ── Internal project documents ─────────────────────────────────────────────
-CLAUDE.md
-NOTES.md
-ROADMAP.md
-
 # ── Python ─────────────────────────────────────────────────────────────────
 __pycache__/
 *.py[cod]
@@ -24,7 +19,7 @@ Makefile
 build/
 
 # ── Generated benchmark outputs ────────────────────────────────────────────
-results/
+# results/ is committed on purpose: every number in the README cites a file in it.
 
 # ── macOS ──────────────────────────────────────────────────────────────────
 .DS_Store
