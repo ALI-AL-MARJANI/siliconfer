@@ -1,39 +1,240 @@
 // q4_gemv.cpp — hand-written NEON 4-bit GEMV for Apple Silicon.
 //
-// GEMV (y = W_q4 x) is the memory-bandwidth-bound decode kernel.
-// Loading 4-bit weights instead of 16-bit cuts DRAM traffic by ~4×.
+// GEMV (y = W_q4 x) is the decode kernel: one product per linear layer per
+// generated token.
 //
-// Inner-loop strategy (symmetric, group_size multiple of 32):
-//   For each output row i and each group g:
-//     1. Load 16 packed bytes (= 32 int4 values) into uint8x16.
-//     2. Extract lo/hi nibbles; sign-extend 4→8 bits via shift trick.
-//     3. Load 32 floats from x; deinterleave even/odd with vuzpq_f32.
-//     4. Convert int8→float32 via vmovl chain; FMA into 4 float32x4 accums.
-//   Reduce accumulators → scalar, multiply by scale, add to y[i].
+// Inner loop (per output row, per group, 16 packed bytes = 32 weights at a time):
+//   1. Load 16 bytes. Sign-extend both nibbles with shifts:
+//        hi = asr(byte, 4)            lo = asr(lsl(byte, 4), 4)
+//   2. Interleave lo/hi (zip) so the 32 int8 weights are in column order —
+//      cheaper than de-interleaving the 32 floats of x for every row.
+//   3. Widen int8 → int16 → int32 → float32 (8 vectors of 4).
+//   4. FMA each vector against x into its own accumulator. Eight independent
+//      accumulators keep the loop throughput-bound rather than bound by the
+//      latency of one FMA chain.
+//   Reduce the accumulators, multiply by the group scale, add to y[i].
 //
-// For in_features not a multiple of 32: scalar tail loop.
+// Rows are independent, so large products are split across threads by row
+// range (Grand Central Dispatch). The result for a row does not depend on the
+// thread count.
+//
+// Group sizes that are not a multiple of 32 fall through to a scalar tail.
 
 #include "q4_gemv.h"
-#include <cstring>
+
+#include <algorithm>
+#include <vector>
+
+#ifdef __APPLE__
+#include <dispatch/dispatch.h>
+#include <sys/sysctl.h>
+#endif
+
+// ---------------------------------------------------------------------------
+// Threading
+// ---------------------------------------------------------------------------
+
+// Below this many weights a product runs on the calling thread: waking worker
+// threads costs more than the product itself.
+static const size_t kMinParallelWeights = 1u << 19;
+
+static int default_num_threads() {
+#ifdef __APPLE__
+    int n = 0;
+    size_t len = sizeof(n);
+    if (sysctlbyname("hw.perflevel0.physicalcpu", &n, &len, nullptr, 0) == 0 && n > 0) return n;
+#endif
+    return 1;
+}
+
+static int g_num_threads = default_num_threads();
+
+void q4_set_num_threads(int n) { g_num_threads = std::max(1, n); }
+int  q4_get_num_threads()      { return g_num_threads; }
+
+namespace {
+
+struct RowJob {
+    void (*fn)(void* ctx, int r0, int r1);
+    void* ctx;
+    int n_rows;
+    int n_chunks;
+};
+
+void run_chunk(void* p, size_t c) {
+    const RowJob* job = static_cast<const RowJob*>(p);
+    int r0 = (int)((long long)c * job->n_rows / job->n_chunks);
+    int r1 = (int)((long long)(c + 1) * job->n_rows / job->n_chunks);
+    job->fn(job->ctx, r0, r1);
+}
+
+// Run fn(ctx, r0, r1) over [0, n_rows), split across threads when worthwhile.
+void parallel_rows(int n_rows, size_t n_weights, void (*fn)(void*, int, int), void* ctx) {
+#ifdef __APPLE__
+    int n_chunks = std::min(g_num_threads, n_rows);
+    if (n_chunks > 1 && n_weights >= kMinParallelWeights) {
+        RowJob job{fn, ctx, n_rows, n_chunks};
+        dispatch_apply_f((size_t)n_chunks,
+                         dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0),
+                         &job, run_chunk);
+        return;
+    }
+#endif
+    fn(ctx, 0, n_rows);
+}
+
+struct GemvCtx {
+    const uint8_t* W;
+    const float* scales;
+    const float* zeros;     // nullptr for symmetric
+    const float* x;
+    const float* x_gsum;    // per-group sum of x (asymmetric only)
+    float* y;
+    int in_f;
+    int group_size;
+};
+
+struct DequantCtx {
+    const uint8_t* W;
+    const float* scales;
+    const float* zeros;
+    float* out;
+    int r_base;
+    int in_f;
+    int group_size;
+};
+
+}  // namespace
 
 #ifdef __ARM_NEON
 #include <arm_neon.h>
 
-// Sign-extend a uint8x16 of 4-bit values (in lower nibble, range 0..15)
-// to signed int8x16 in range [-8..7].
-// Method: shift left 4 (puts 4-bit sign in bit 7), arithmetic shift right 4.
-static inline int8x16_t sign_ext4_neon(uint8x16_t nibbles) {
-    return vshrq_n_s8(vshlq_n_s8(vreinterpretq_s8_u8(nibbles), 4), 4);
+namespace {
+
+// 16 packed bytes → 32 weights as 8 float32x4, in column order.
+// Symmetric: nibbles are two's complement.
+inline void unpack32_sym(const uint8_t* p, float32x4_t f[8]) {
+    int8x16_t b  = vreinterpretq_s8_u8(vld1q_u8(p));
+    int8x16_t hi = vshrq_n_s8(b, 4);
+    int8x16_t lo = vshrq_n_s8(vshlq_n_s8(b, 4), 4);
+    int8x16_t wa = vzip1q_s8(lo, hi);     // columns 0..15
+    int8x16_t wb = vzip2q_s8(lo, hi);     // columns 16..31
+    int16x8_t a0 = vmovl_s8(vget_low_s8(wa)), a1 = vmovl_high_s8(wa);
+    int16x8_t b0 = vmovl_s8(vget_low_s8(wb)), b1 = vmovl_high_s8(wb);
+    f[0] = vcvtq_f32_s32(vmovl_s16(vget_low_s16(a0)));  f[1] = vcvtq_f32_s32(vmovl_high_s16(a0));
+    f[2] = vcvtq_f32_s32(vmovl_s16(vget_low_s16(a1)));  f[3] = vcvtq_f32_s32(vmovl_high_s16(a1));
+    f[4] = vcvtq_f32_s32(vmovl_s16(vget_low_s16(b0)));  f[5] = vcvtq_f32_s32(vmovl_high_s16(b0));
+    f[6] = vcvtq_f32_s32(vmovl_s16(vget_low_s16(b1)));  f[7] = vcvtq_f32_s32(vmovl_high_s16(b1));
 }
 
-// Horizontal sum of float32x4.
-static inline float hsum_f32x4(float32x4_t v) {
-    return vaddvq_f32(v);
+// Asymmetric: nibbles are unsigned [0, 15].
+inline void unpack32_asym(const uint8_t* p, float32x4_t f[8]) {
+    uint8x16_t b  = vld1q_u8(p);
+    uint8x16_t hi = vshrq_n_u8(b, 4);
+    uint8x16_t lo = vandq_u8(b, vdupq_n_u8(0x0F));
+    uint8x16_t wa = vzip1q_u8(lo, hi);
+    uint8x16_t wb = vzip2q_u8(lo, hi);
+    uint16x8_t a0 = vmovl_u8(vget_low_u8(wa)), a1 = vmovl_high_u8(wa);
+    uint16x8_t b0 = vmovl_u8(vget_low_u8(wb)), b1 = vmovl_high_u8(wb);
+    f[0] = vcvtq_f32_u32(vmovl_u16(vget_low_u16(a0)));  f[1] = vcvtq_f32_u32(vmovl_high_u16(a0));
+    f[2] = vcvtq_f32_u32(vmovl_u16(vget_low_u16(a1)));  f[3] = vcvtq_f32_u32(vmovl_high_u16(a1));
+    f[4] = vcvtq_f32_u32(vmovl_u16(vget_low_u16(b0)));  f[5] = vcvtq_f32_u32(vmovl_high_u16(b0));
+    f[6] = vcvtq_f32_u32(vmovl_u16(vget_low_u16(b1)));  f[7] = vcvtq_f32_u32(vmovl_high_u16(b1));
 }
 
-// ---------------------------------------------------------------------------
-// q4_gemv_sym_neon
-// ---------------------------------------------------------------------------
+inline float nibble_sym(uint8_t u) { return (float)((u < 8) ? (int)u : (int)u - 16); }
+
+// Σ_c nibble(c) · x[c] over one group; `sym` selects the nibble decoding.
+template <bool SYM>
+inline float group_dot(const uint8_t* wg, const float* xg, int half_gs) {
+    int n_vec = half_gs / 16;
+    float32x4_t acc[8];
+    for (int k = 0; k < 8; k++) acc[k] = vdupq_n_f32(0.0f);
+
+    for (int b = 0; b < n_vec; b++) {
+        float32x4_t f[8];
+        if (SYM) unpack32_sym(wg + 16 * b, f); else unpack32_asym(wg + 16 * b, f);
+        const float* xp = xg + 32 * b;
+        for (int k = 0; k < 8; k++) acc[k] = vfmaq_f32(acc[k], f[k], vld1q_f32(xp + 4 * k));
+    }
+
+    float32x4_t s = vaddq_f32(vaddq_f32(vaddq_f32(acc[0], acc[1]), vaddq_f32(acc[2], acc[3])),
+                              vaddq_f32(vaddq_f32(acc[4], acc[5]), vaddq_f32(acc[6], acc[7])));
+    float dot = vaddvq_f32(s);
+
+    for (int c = n_vec * 16; c < half_gs; c++) {
+        uint8_t byte = wg[c];
+        float lo = SYM ? nibble_sym(byte & 0x0F) : (float)(byte & 0x0F);
+        float hi = SYM ? nibble_sym(byte >> 4)   : (float)(byte >> 4);
+        dot += lo * xg[2 * c] + hi * xg[2 * c + 1];
+    }
+    return dot;
+}
+
+void gemv_rows(void* p, int r0, int r1) {
+    const GemvCtx& c = *static_cast<const GemvCtx*>(p);
+    int n_groups = c.in_f / c.group_size;
+    int half_gs  = c.group_size / 2;
+
+    for (int i = r0; i < r1; i++) {
+        const uint8_t* w_row = c.W + (size_t)i * (c.in_f / 2);
+        const float*   s_row = c.scales + (size_t)i * n_groups;
+        float y_val = 0.0f;
+
+        if (c.zeros == nullptr) {
+            for (int g = 0; g < n_groups; g++)
+                y_val += group_dot<true>(w_row + g * half_gs, c.x + g * c.group_size, half_gs)
+                         * s_row[g];
+        } else {
+            // (nibble − zero)·scale · x  =  scale · (Σ nibble·x − zero · Σ x)
+            const float* z_row = c.zeros + (size_t)i * n_groups;
+            for (int g = 0; g < n_groups; g++) {
+                float dot = group_dot<false>(w_row + g * half_gs, c.x + g * c.group_size, half_gs);
+                y_val += (dot - z_row[g] * c.x_gsum[g]) * s_row[g];
+            }
+        }
+        c.y[i] = y_val;
+    }
+}
+
+void dequant_rows(void* p, int r0, int r1) {
+    const DequantCtx& c = *static_cast<const DequantCtx*>(p);
+    int n_groups = c.in_f / c.group_size;
+    int half_gs  = c.group_size / 2;
+    int n_vec    = half_gs / 16;
+
+    for (int i = r0; i < r1; i++) {
+        const uint8_t* w_row = c.W + (size_t)i * (c.in_f / 2);
+        const float*   s_row = c.scales + (size_t)i * n_groups;
+        const float*   z_row = c.zeros ? c.zeros + (size_t)i * n_groups : nullptr;
+        float* o_row = c.out + (size_t)(i - c.r_base) * c.in_f;
+
+        for (int g = 0; g < n_groups; g++) {
+            const uint8_t* wg = w_row + g * half_gs;
+            float* og = o_row + g * c.group_size;
+            float sc = s_row[g];
+            float zp = z_row ? z_row[g] : 0.0f;
+            float32x4_t vsc = vdupq_n_f32(sc), vzp = vdupq_n_f32(zp);
+
+            for (int b = 0; b < n_vec; b++) {
+                float32x4_t f[8];
+                if (z_row) unpack32_asym(wg + 16 * b, f); else unpack32_sym(wg + 16 * b, f);
+                for (int k = 0; k < 8; k++)
+                    vst1q_f32(og + 32 * b + 4 * k, vmulq_f32(vsubq_f32(f[k], vzp), vsc));
+            }
+            for (int cb = n_vec * 16; cb < half_gs; cb++) {
+                uint8_t byte = wg[cb];
+                float lo = z_row ? (float)(byte & 0x0F) : nibble_sym(byte & 0x0F);
+                float hi = z_row ? (float)(byte >> 4)   : nibble_sym(byte >> 4);
+                og[2 * cb]     = (lo - zp) * sc;
+                og[2 * cb + 1] = (hi - zp) * sc;
+            }
+        }
+    }
+}
+
+}  // namespace
+
 void q4_gemv_sym_neon(
     const uint8_t* __restrict__ W,
     const float*   __restrict__ scales,
@@ -41,107 +242,10 @@ void q4_gemv_sym_neon(
     float*         __restrict__ y,
     int out_f, int in_f, int group_size
 ) {
-    int n_groups = in_f / group_size;
-    int half_gs  = group_size / 2;          // bytes per row per group
-    int n_vec    = half_gs / 16;            // 16-byte (128-bit) chunks per group
-    int n_vec_32 = half_gs & 0xF;          // leftover bytes after vec chunks
-
-    for (int i = 0; i < out_f; i++) {
-        const uint8_t* w_row = W + (size_t)i * (in_f / 2);
-        const float*   s_row = scales + i * n_groups;
-        float y_val = 0.0f;
-
-        for (int g = 0; g < n_groups; g++) {
-            const uint8_t* wg = w_row + g * half_gs;
-            const float*   xg = x + g * group_size;
-
-            float32x4_t acc0 = vdupq_n_f32(0.0f);
-            float32x4_t acc1 = vdupq_n_f32(0.0f);
-            float32x4_t acc2 = vdupq_n_f32(0.0f);
-            float32x4_t acc3 = vdupq_n_f32(0.0f);
-
-            // Vectorised: 16 packed bytes per iteration = 32 int4 = 32 float MACs
-            for (int b = 0; b < n_vec; b++) {
-                uint8x16_t packed = vld1q_u8(wg + 16 * b);
-
-                // Unpack nibbles → signed int8
-                int8x16_t lo_s = sign_ext4_neon(vandq_u8(packed, vdupq_n_u8(0x0F)));
-                int8x16_t hi_s = sign_ext4_neon(vshrq_n_u8(packed, 4));
-
-                // Load 32 floats from x (8 float32x4 vectors)
-                const float* xp = xg + 32 * b;
-                float32x4_t x0 = vld1q_f32(xp);
-                float32x4_t x1 = vld1q_f32(xp + 4);
-                float32x4_t x2 = vld1q_f32(xp + 8);
-                float32x4_t x3 = vld1q_f32(xp + 12);
-                float32x4_t x4 = vld1q_f32(xp + 16);
-                float32x4_t x5 = vld1q_f32(xp + 20);
-                float32x4_t x6 = vld1q_f32(xp + 24);
-                float32x4_t x7 = vld1q_f32(xp + 28);
-
-                // Deinterleave x: separate even-index and odd-index x values
-                // vuzpq_f32(a,b): .val[0] = {a0,a2,b0,b2}, .val[1] = {a1,a3,b1,b3}
-                float32x4x2_t xd01 = vuzpq_f32(x0, x1);   // ch 0..7  even/odd
-                float32x4x2_t xd23 = vuzpq_f32(x2, x3);   // ch 8..15 even/odd
-                float32x4x2_t xd45 = vuzpq_f32(x4, x5);   // ch 16..23
-                float32x4x2_t xd67 = vuzpq_f32(x6, x7);   // ch 24..31
-
-                // Convert lo int8 → float32 (4 values at a time)
-                int16x8_t lo16_lo = vmovl_s8(vget_low_s8(lo_s));   // lo[0..7]→int16
-                int16x8_t lo16_hi = vmovl_s8(vget_high_s8(lo_s));  // lo[8..15]→int16
-
-                float32x4_t lo_f0 = vcvtq_f32_s32(vmovl_s16(vget_low_s16(lo16_lo)));   // w[0,2,4,6]
-                float32x4_t lo_f1 = vcvtq_f32_s32(vmovl_s16(vget_high_s16(lo16_lo)));  // w[8,10,12,14]
-                float32x4_t lo_f2 = vcvtq_f32_s32(vmovl_s16(vget_low_s16(lo16_hi)));   // w[16,18,20,22]
-                float32x4_t lo_f3 = vcvtq_f32_s32(vmovl_s16(vget_high_s16(lo16_hi)));  // w[24,26,28,30]
-
-                // FMA: acc += w_even × x_even
-                acc0 = vmlaq_f32(acc0, lo_f0, xd01.val[0]);
-                acc1 = vmlaq_f32(acc1, lo_f1, xd23.val[0]);
-                acc2 = vmlaq_f32(acc2, lo_f2, xd45.val[0]);
-                acc3 = vmlaq_f32(acc3, lo_f3, xd67.val[0]);
-
-                // Convert hi int8 → float32 (odd channels)
-                int16x8_t hi16_lo = vmovl_s8(vget_low_s8(hi_s));
-                int16x8_t hi16_hi = vmovl_s8(vget_high_s8(hi_s));
-
-                float32x4_t hi_f0 = vcvtq_f32_s32(vmovl_s16(vget_low_s16(hi16_lo)));   // w[1,3,5,7]
-                float32x4_t hi_f1 = vcvtq_f32_s32(vmovl_s16(vget_high_s16(hi16_lo)));  // w[9,11,13,15]
-                float32x4_t hi_f2 = vcvtq_f32_s32(vmovl_s16(vget_low_s16(hi16_hi)));   // w[17,19,21,23]
-                float32x4_t hi_f3 = vcvtq_f32_s32(vmovl_s16(vget_high_s16(hi16_hi)));  // w[25,27,29,31]
-
-                // FMA: acc += w_odd × x_odd
-                acc0 = vmlaq_f32(acc0, hi_f0, xd01.val[1]);
-                acc1 = vmlaq_f32(acc1, hi_f1, xd23.val[1]);
-                acc2 = vmlaq_f32(acc2, hi_f2, xd45.val[1]);
-                acc3 = vmlaq_f32(acc3, hi_f3, xd67.val[1]);
-            }
-
-            // Reduce 4 accumulators → scalar, apply scale
-            float32x4_t total = vaddq_f32(vaddq_f32(acc0, acc1), vaddq_f32(acc2, acc3));
-            float g_sum = hsum_f32x4(total);
-
-            // Scalar tail (handles leftover bytes if half_gs % 16 != 0)
-            int tail_start = n_vec * 16;
-            for (int c = tail_start; c < half_gs; c++) {
-                uint8_t byte = wg[c];
-                uint8_t lo_u = byte & 0x0F;
-                uint8_t hi_u = byte >> 4;
-                int8_t lo_sv = (lo_u < 8) ? (int8_t)lo_u : (int8_t)((int)lo_u - 16);
-                int8_t hi_sv = (hi_u < 8) ? (int8_t)hi_u : (int8_t)((int)hi_u - 16);
-                g_sum += (float)lo_sv * xg[2 * c];
-                g_sum += (float)hi_sv * xg[2 * c + 1];
-            }
-
-            y_val += g_sum * s_row[g];
-        }
-        y[i] = y_val;
-    }
+    GemvCtx ctx{W, scales, nullptr, x, nullptr, y, in_f, group_size};
+    parallel_rows(out_f, (size_t)out_f * in_f, gemv_rows, &ctx);
 }
 
-// ---------------------------------------------------------------------------
-// q4_gemv_asym_neon  (asymmetric: dequant = (nibble - zero) * scale)
-// ---------------------------------------------------------------------------
 void q4_gemv_asym_neon(
     const uint8_t* __restrict__ W,
     const float*   __restrict__ scales,
@@ -150,94 +254,41 @@ void q4_gemv_asym_neon(
     float*         __restrict__ y,
     int out_f, int in_f, int group_size
 ) {
+    // Σ x per group is the same for every row: compute it once.
     int n_groups = in_f / group_size;
-    int half_gs  = group_size / 2;
-    int n_vec    = half_gs / 16;
-
-    for (int i = 0; i < out_f; i++) {
-        const uint8_t* w_row = W + (size_t)i * (in_f / 2);
-        const float*   s_row = scales + i * n_groups;
-        const float*   z_row = zeros  + i * n_groups;
-        float y_val = 0.0f;
-
-        for (int g = 0; g < n_groups; g++) {
-            const uint8_t* wg = w_row + g * half_gs;
-            const float*   xg = x + g * group_size;
-            float sc = s_row[g];
-            float zp = z_row[g];   // zero-point (subtract from unsigned nibble)
-
-            float32x4_t acc0 = vdupq_n_f32(0.0f);
-            float32x4_t acc1 = vdupq_n_f32(0.0f);
-            float32x4_t acc2 = vdupq_n_f32(0.0f);
-            float32x4_t acc3 = vdupq_n_f32(0.0f);
-
-            // Accumulate x sum for the bias term: sum(x) * (-zp) * sc
-            float32x4_t x_sum = vdupq_n_f32(0.0f);
-
-            for (int b = 0; b < n_vec; b++) {
-                uint8x16_t packed = vld1q_u8(wg + 16 * b);
-                // For asymmetric, keep nibbles as unsigned [0..15]
-                uint8x16_t lo_u = vandq_u8(packed, vdupq_n_u8(0x0F));
-                uint8x16_t hi_u = vshrq_n_u8(packed, 4);
-
-                // Widen unsigned uint8→uint16→uint32→float32
-                uint16x8_t lo16_lo = vmovl_u8(vget_low_u8(lo_u));
-                uint16x8_t lo16_hi = vmovl_u8(vget_high_u8(lo_u));
-                uint16x8_t hi16_lo = vmovl_u8(vget_low_u8(hi_u));
-                uint16x8_t hi16_hi = vmovl_u8(vget_high_u8(hi_u));
-
-                float32x4_t lof0 = vcvtq_f32_u32(vmovl_u16(vget_low_u16(lo16_lo)));
-                float32x4_t lof1 = vcvtq_f32_u32(vmovl_u16(vget_high_u16(lo16_lo)));
-                float32x4_t lof2 = vcvtq_f32_u32(vmovl_u16(vget_low_u16(lo16_hi)));
-                float32x4_t lof3 = vcvtq_f32_u32(vmovl_u16(vget_high_u16(lo16_hi)));
-                float32x4_t hif0 = vcvtq_f32_u32(vmovl_u16(vget_low_u16(hi16_lo)));
-                float32x4_t hif1 = vcvtq_f32_u32(vmovl_u16(vget_high_u16(hi16_lo)));
-                float32x4_t hif2 = vcvtq_f32_u32(vmovl_u16(vget_low_u16(hi16_hi)));
-                float32x4_t hif3 = vcvtq_f32_u32(vmovl_u16(vget_high_u16(hi16_hi)));
-
-                const float* xp = xg + 32 * b;
-                float32x4x2_t xd01 = vuzpq_f32(vld1q_f32(xp),    vld1q_f32(xp+4));
-                float32x4x2_t xd23 = vuzpq_f32(vld1q_f32(xp+8),  vld1q_f32(xp+12));
-                float32x4x2_t xd45 = vuzpq_f32(vld1q_f32(xp+16), vld1q_f32(xp+20));
-                float32x4x2_t xd67 = vuzpq_f32(vld1q_f32(xp+24), vld1q_f32(xp+28));
-
-                acc0 = vmlaq_f32(acc0, lof0, xd01.val[0]);
-                acc1 = vmlaq_f32(acc1, lof1, xd23.val[0]);
-                acc2 = vmlaq_f32(acc2, lof2, xd45.val[0]);
-                acc3 = vmlaq_f32(acc3, lof3, xd67.val[0]);
-                acc0 = vmlaq_f32(acc0, hif0, xd01.val[1]);
-                acc1 = vmlaq_f32(acc1, hif1, xd23.val[1]);
-                acc2 = vmlaq_f32(acc2, hif2, xd45.val[1]);
-                acc3 = vmlaq_f32(acc3, hif3, xd67.val[1]);
-
-                // Accumulate x for bias
-                x_sum = vaddq_f32(x_sum, vaddq_f32(xd01.val[0], xd01.val[1]));
-                x_sum = vaddq_f32(x_sum, vaddq_f32(xd23.val[0], xd23.val[1]));
-                x_sum = vaddq_f32(x_sum, vaddq_f32(xd45.val[0], xd45.val[1]));
-                x_sum = vaddq_f32(x_sum, vaddq_f32(xd67.val[0], xd67.val[1]));
-            }
-
-            float32x4_t total = vaddq_f32(vaddq_f32(acc0, acc1), vaddq_f32(acc2, acc3));
-            float dot = hsum_f32x4(total);
-            float xs  = hsum_f32x4(x_sum);
-
-            // Scalar tail
-            float tail_dot = 0.0f, tail_xs = 0.0f;
-            for (int c = n_vec * 16; c < half_gs; c++) {
-                uint8_t byte = wg[c];
-                float lo_v = (float)(byte & 0x0F);
-                float hi_v = (float)(byte >> 4);
-                tail_dot += lo_v * xg[2*c] + hi_v * xg[2*c+1];
-                tail_xs  += xg[2*c] + xg[2*c+1];
-            }
-
-            y_val += ((dot + tail_dot) - zp * (xs + tail_xs)) * sc;
-        }
-        y[i] = y_val;
+    std::vector<float> x_gsum(n_groups);
+    for (int g = 0; g < n_groups; g++) {
+        const float* xg = x + g * group_size;
+        float32x4_t s = vdupq_n_f32(0.0f);
+        int c = 0;
+        for (; c + 4 <= group_size; c += 4) s = vaddq_f32(s, vld1q_f32(xg + c));
+        float t = vaddvq_f32(s);
+        for (; c < group_size; c++) t += xg[c];
+        x_gsum[g] = t;
     }
+    GemvCtx ctx{W, scales, zeros, x, x_gsum.data(), y, in_f, group_size};
+    parallel_rows(out_f, (size_t)out_f * in_f, gemv_rows, &ctx);
 }
 
-#else  // __ARM_NEON not available — route NEON paths to scalar
+void q4_dequant_rows(
+    const uint8_t* __restrict__ W,
+    const float*   __restrict__ scales,
+    const float*   __restrict__ zeros,
+    float*         __restrict__ out,
+    int r0, int r1, int in_f, int group_size
+) {
+    DequantCtx ctx{W, scales, zeros, out, r0, in_f, group_size};
+    // parallel_rows hands out ranges relative to 0; shift them by r0.
+    struct Shift { DequantCtx* c; int r0; } shift{&ctx, r0};
+    parallel_rows(r1 - r0, (size_t)(r1 - r0) * in_f,
+                  [](void* p, int a, int b) {
+                      Shift* s = static_cast<Shift*>(p);
+                      dequant_rows(s->c, s->r0 + a, s->r0 + b);
+                  },
+                  &shift);
+}
+
+#else  // no NEON: scalar implementations with the same semantics
 
 void q4_gemv_sym_neon(
     const uint8_t* W, const float* scales, const float* x, float* y,
@@ -246,12 +297,36 @@ void q4_gemv_sym_neon(
     q4_gemv_sym_scalar(W, scales, x, y, out_f, in_f, group_size);
 }
 
+void q4_dequant_rows(
+    const uint8_t* W, const float* scales, const float* zeros, float* out,
+    int r0, int r1, int in_f, int group_size
+) {
+    int n_groups = in_f / group_size;
+    for (int i = r0; i < r1; i++) {
+        const uint8_t* w_row = W + (size_t)i * (in_f / 2);
+        for (int c = 0; c < in_f; c++) {
+            uint8_t byte = w_row[c / 2];
+            uint8_t u = (c & 1) ? (byte >> 4) : (byte & 0x0F);
+            int g = c / group_size;
+            float sc = scales[(size_t)i * n_groups + g];
+            float v = zeros ? (float)u - zeros[(size_t)i * n_groups + g]
+                            : (float)((u < 8) ? (int)u : (int)u - 16);
+            out[(size_t)(i - r0) * in_f + c] = v * sc;
+        }
+    }
+}
+
 void q4_gemv_asym_neon(
     const uint8_t* W, const float* scales, const float* zeros,
     const float* x, float* y, int out_f, int in_f, int group_size
 ) {
-    // Fallback: just use scalar sym (incorrect, but avoids link error on non-ARM)
-    q4_gemv_sym_scalar(W, scales, x, y, out_f, in_f, group_size);
+    std::vector<float> row(in_f);
+    for (int i = 0; i < out_f; i++) {
+        q4_dequant_rows(W, scales, zeros, row.data(), i, i + 1, in_f, group_size);
+        float acc = 0.0f;
+        for (int c = 0; c < in_f; c++) acc += row[c] * x[c];
+        y[i] = acc;
+    }
 }
 
 #endif  // __ARM_NEON

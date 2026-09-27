@@ -1,4 +1,4 @@
-"""Phase 5 kernel tests: NEON q4 GEMV/GEMM correctness.
+"""Kernel tests: NEON q4 GEMV/GEMM correctness.
 
 These tests run against the compiled siliconfer_neon extension if it is built,
 or against the numpy fallback if it is not. In both cases the results should
@@ -10,16 +10,19 @@ import pytest
 
 from siliconfer.kernels.neon import (
     NEON_AVAILABLE,
-    pack_weights_sym,
-    pack_weights_asym,
-    gemv_sym,
-    gemv_scalar,
-    gemv_asym,
-    gemm_sym,
+    dequant,
     gemm_asym,
+    gemm_sym,
+    gemv_asym,
+    gemv_scalar,
+    gemv_sym,
+    get_num_threads,
+    pack_weights_asym,
+    pack_weights_on_grid,
+    pack_weights_sym,
+    set_num_threads,
 )
-from siliconfer.quant.primitives import fake_quantize, quantize_sym, dequantize_sym
-
+from siliconfer.quant.primitives import fake_quantize
 
 # ---------------------------------------------------------------------------
 # Reference: numpy GEMV using fake-quant weights
@@ -152,10 +155,8 @@ def test_gemm_sym_matches_gemv_loop(T):
 
 
 # ---------------------------------------------------------------------------
-# GEMM correctness, asymmetric (Phase 9-follow-up: closes the gap documented
-# in CLAUDE.md §9 — Q4Linear previously had no way to run prefill on
-# asymmetrically-quantized weights at all, silently corrupting HQQ's output
-# by re-packing it symmetric).
+# GEMM correctness, asymmetric (see docs/packing.md: without this kernel
+# Q4Linear could not run prefill on asymmetrically-quantized weights).
 # ---------------------------------------------------------------------------
 
 def _ref_gemv_asym(W_fp32: np.ndarray, x: np.ndarray, group_size: int) -> np.ndarray:
@@ -180,7 +181,11 @@ def test_gemv_asym_matches_reference(group_size):
 
 @pytest.mark.parametrize("T", [1, 4, 32])
 def test_gemm_asym_matches_gemv_asym_loop(T):
-    """GEMM (asymmetric) output should equal T independent GEMV(asym) calls."""
+    """GEMM (asymmetric) output should equal T independent GEMV(asym) calls.
+
+    For T >= 4 the GEMM dequantizes a tile and calls BLAS, while GEMV evaluates
+    scale * (sum(nibble * x) - zero * sum(x)); the two are equal algebraically
+    but round differently in float32, hence a float32-level tolerance."""
     rng = np.random.default_rng(99)
     out_f, in_f = 64, 128
     W = rng.normal(0, 1, (out_f, in_f)).astype(np.float32)
@@ -192,7 +197,7 @@ def test_gemm_asym_matches_gemv_asym_loop(T):
     Y_ref = np.stack([gemv_asym(packed, scales, zeros, X[t]) for t in range(T)])
 
     assert Y_gemm.shape == (T, out_f)
-    np.testing.assert_allclose(Y_gemm, Y_ref, atol=1e-5)
+    np.testing.assert_allclose(Y_gemm, Y_ref, atol=1e-3, rtol=1e-3)
 
 
 def test_gemm_asym_matches_reference_matmul():
@@ -211,6 +216,74 @@ def test_gemm_asym_matches_reference_matmul():
 
 
 # ---------------------------------------------------------------------------
+# Dequantization, tiling and threading
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("sym", [True, False])
+@pytest.mark.parametrize("group_size", [16, 64, 128])
+def test_dequant_matches_fake_quant(sym, group_size):
+    """Kernel-side dequantization reproduces the fake-quantized weight. group_size
+    16 has no full 16-byte vector per group, so it exercises the scalar tail."""
+    rng = np.random.default_rng(12)
+    W = rng.normal(0, 1, (40, 256)).astype(np.float32)
+    if sym:
+        packed, scales = pack_weights_sym(W, group_size=group_size)
+        W_deq = dequant(packed, scales, None, group_size)
+    else:
+        packed, scales, zeros = pack_weights_asym(W, group_size=group_size)
+        W_deq = dequant(packed, scales, zeros, group_size)
+    np.testing.assert_allclose(W_deq, fake_quantize(W, group_size, sym), atol=1e-5, rtol=1e-5)
+
+
+@pytest.mark.parametrize("sym", [True, False])
+def test_gemm_spans_several_tiles(sym):
+    """out_f * in_f larger than one dequantization tile: every tile must land in
+    the right output columns."""
+    rng = np.random.default_rng(13)
+    out_f, in_f, T = 700, 896, 6       # tile = 292 rows at in_f=896 -> 3 tiles
+    W = rng.normal(0, 1, (out_f, in_f)).astype(np.float32)
+    X = rng.normal(0, 1, (T, in_f)).astype(np.float32)
+    if sym:
+        packed, scales = pack_weights_sym(W)
+        Y = gemm_sym(packed, scales, X)
+    else:
+        packed, scales, zeros = pack_weights_asym(W)
+        Y = gemm_asym(packed, scales, zeros, X)
+    Y_ref = X @ fake_quantize(W, 128, sym).T
+    np.testing.assert_allclose(Y, Y_ref, atol=2e-3, rtol=2e-3)
+
+
+@pytest.mark.skipif(not NEON_AVAILABLE, reason="threading lives in the compiled kernel")
+@pytest.mark.parametrize("sym", [True, False])
+def test_gemv_result_independent_of_thread_count(sym):
+    """Rows are computed independently, so the thread count must not change a
+    single bit of the result. The matrix is large enough to take the threaded path."""
+    rng = np.random.default_rng(14)
+    out_f, in_f = 1536, 1024           # 1.57M weights > the 2**19 threading threshold
+    W = rng.normal(0, 1, (out_f, in_f)).astype(np.float32)
+    x = rng.normal(0, 1, in_f).astype(np.float32)
+    if sym:
+        packed, scales = pack_weights_sym(W)
+        run = lambda: gemv_sym(packed, scales, x)
+    else:
+        packed, scales, zeros = pack_weights_asym(W)
+        run = lambda: gemv_asym(packed, scales, zeros, x)
+
+    before = get_num_threads()
+    try:
+        set_num_threads(1)
+        y1 = run()
+        set_num_threads(4)
+        y4 = [run() for _ in range(5)]
+    finally:
+        set_num_threads(before)
+
+    for y in y4:
+        np.testing.assert_array_equal(y, y1)
+    np.testing.assert_allclose(y1, fake_quantize(W, 128, sym) @ x, atol=2e-3, rtol=2e-3)
+
+
+# ---------------------------------------------------------------------------
 # Extension availability
 # ---------------------------------------------------------------------------
 
@@ -224,3 +297,38 @@ def test_kernel_import():
     packed, scales = pack_weights_sym(W, group_size=64)
     y = gemv_sym(packed, scales, x, group_size=64)
     assert y.shape == (16,)
+
+
+# ---------------------------------------------------------------------------
+# Packing on a given grid (quantizers that fix the grid before moving weights)
+# ---------------------------------------------------------------------------
+
+def test_pack_on_grid_is_exact_where_rederiving_the_grid_is_not():
+    """A group whose largest code is 6 (never reaches 7) and a group that uses
+    code -8: both are legal outputs of GPTQ, and in both the scale cannot be
+    recovered from max|w|/7. pack_weights_on_grid must reproduce the weight
+    exactly; pack_weights_sym visibly does not."""
+    gs = 32
+    scale = np.array([[0.5, 0.25]], dtype=np.float32)
+    codes = np.zeros((1, 2 * gs), dtype=np.int64)
+    codes[0, :gs] = np.resize(np.arange(-6, 7), gs)          # max |code| = 6
+    codes[0, gs:] = np.resize(np.arange(-8, 8), gs)          # uses -8
+    W_q = (codes * np.repeat(scale, gs, axis=1)).astype(np.float32)
+
+    packed = pack_weights_on_grid(W_q, scale, None, group_size=gs)
+    np.testing.assert_array_equal(dequant(packed, scale, None, gs), W_q)
+
+    packed_bad, scale_bad = pack_weights_sym(W_q, group_size=gs)
+    assert np.abs(dequant(packed_bad, scale_bad, None, gs) - W_q).max() > 0.01
+
+
+def test_pack_on_grid_asymmetric_partial_range():
+    """Asymmetric codes that do not span 0..15: min/max would give another grid."""
+    gs = 32
+    scale = np.array([[0.1]], dtype=np.float32)
+    zero = np.array([[5.0]], dtype=np.float32)
+    codes = np.resize(np.arange(2, 12), gs)[None, :]         # only 2..11 used
+    W_q = ((codes - zero[0, 0]) * scale[0, 0]).astype(np.float32)
+
+    packed = pack_weights_on_grid(W_q, scale, zero, group_size=gs)
+    np.testing.assert_allclose(dequant(packed, scale, zero, gs), W_q, atol=1e-7)

@@ -1,74 +1,28 @@
-"""Fused quantized-KV attention for the decode phase (Phase 9c, tiled in 9f).
+"""Decode-step attention computed directly on an int8 KV cache (Metal).
 
-Closes a real gap in MLX: as of this writing MLX has no first-class fused
-quantized-KV `scaled_dot_product_attention` (confirmed absent — several
-"quantized SDPA" PRs on ml-explore/mlx exist but are closed/unmerged), so the
-straightforward integration path (Phase 9b) dequantizes the whole
-`QuantizedKVCache` back to fp16/fp32 before calling the standard SDPA op,
-materializing a full-precision copy of the cache on every single decode step.
+MLX has no attention primitive that reads a quantized cache, so the plain
+path dequantizes the whole cache before every attention call. This kernel
+dequantizes keys and values inline and accumulates the output with a
+single-pass online softmax, so the cache is never expanded to floats. It
+handles one query token (decode); prefill uses the standard path.
 
-This kernel instead dequantizes int8 keys/values *inline*, running an online
-(numerically-stable, single-pass) softmax so the whole attention output for a
-head is produced without ever materializing a full-precision K/V array.
-Scope: this targets the decode phase specifically (one new query token,
-T_q=1) attending over the full existing `QuantizedKVCache`; prefill still
-uses the standard path (T_q>1 attention is far less memory-bandwidth-bound,
-so there's less to gain there — see CLAUDE.md's roofline argument for why
-decode is the target).
+The cache axis is split into `n_tiles` tiles. Each tile is a threadgroup of
+`head_dim` threads that produces a partial result (m, l, acc): the running
+maximum score, the sum of exp(score − m), and the weighted value sum. The
+tiles are merged with the usual flash-attention rule:
 
-Correctness notes:
-- Uses `metal::precise::exp`, not the default fast-math `exp`. MSL's default
-  `-ffast-math` mode does not guarantee `exp(-INFINITY) == 0`, and the first
-  online-softmax update deliberately evaluates `exp(-INFINITY - score)` to
-  seed the running correction factor at 0 — getting this wrong silently
-  corrupts every subsequent step's normalization.
-- No `simdgroup_matrix`/Metal TensorOps use — intentionally, since per Metal
-  4 TensorOps' own tiling constraints, cooperative matrix instructions add
-  heavy synchronization overhead for small, irregular per-head reductions
-  like this one; plain scalar/parallel-reduction loops are the right shape
-  here, not the wrong one.
+    M   = max_i m_i
+    L   = Σ_i l_i · exp(m_i − M)
+    out = Σ_i acc_i · exp(m_i − M) / L
 
-Three iterations, in increasing order of parallelism (all verified to
-float32 machine-epsilon precision against the reference dequant+native-SDPA
-path before being trusted):
+Tiling is what gives the GPU enough threadgroups to work with: without it
+the kernel launches only batch × heads of them, whatever the cache length.
 
-  v1 — one thread per (batch, head), fully sequential loop over T_cache.
-       Correct; only launches B*n_heads threads total (14 for Qwen2.5-0.5B) —
-       measured 4-30x *slower* than native SDPA (T=128-2048).
-  v2 — one threadgroup per (batch, head), one thread per head_dim index
-       within it (parallel dot-product reduction via threadgroup memory +
-       barriers). Still only B*n_heads *threadgroups* — measured 6-16x
-       slower (T=128-8192), an improvement but nowhere near parity, because
-       threadgroup *count* — not per-threadgroup work — was still the
-       bottleneck: 14 threadgroups can't keep an M4 GPU's execution units
-       busy regardless of how efficient each one is internally.
-  v3 (current) — real flash-attention-style tiling: split T_cache into
-       `n_tiles` chunks, launch B*n_heads*n_tiles threadgroups (one per
-       chunk), each running the same online-softmax loop as v2 but only over
-       its own chunk, producing a *partial* (not-yet-normalized) result.
-       Partial results are merged across the n_tiles axis with the standard
-       flash-attention combine rule (§ below), done as a few cheap native
-       `mx.array` ops (no second kernel dispatch needed — n_tiles is small).
-       This multiplies threadgroup count by n_tiles, which is exactly the
-       axis v1/v2 never touched, and it closed the gap: measured (Qwen2.5-0.5B
-       dims: 14 heads, 2 kv heads, head_dim=64) **0.48-0.95x native SDPA at
-       T=128-2048** — a large jump from v2's 0.06-0.16x at the same sizes —
-       and **1.03-1.13x (i.e. actually faster) from T=4096 to T=16384**,
-       exactly the long-context regime where avoiding full-precision KV
-       materialization matters most. `n_tiles` defaults to a heuristic
-       (`_choose_n_tiles`) but can be passed explicitly; very short contexts
-       (T<=64) still don't have enough total work to amortize tiling
-       overhead and stay below parity even with tuning.
-
-Partial-result merge math (standard flash-attention online-softmax combine):
-given N partial results (m_i, l_i, acc_i) — each tile's own running max,
-sum-of-exp, and un-normalized weighted value sum — the combined result is
-    M = max_i(m_i)
-    L = sum_i( l_i · exp(m_i - M) )
-    ACC[d] = sum_i( acc_i[d] · exp(m_i - M) )
-    out[d] = ACC[d] / L
-which is the same online-softmax update rule the single-tile kernels already
-use internally, just applied once across tiles instead of once per timestep.
+Notes:
+- `metal::precise::exp` is required. The shading language's default
+  fast-math `exp` does not guarantee exp(−inf) == 0, which the first
+  online-softmax step relies on.
+- Timings against MLX attention: scripts/bench_metal_attention.py.
 """
 
 from __future__ import annotations
@@ -181,16 +135,10 @@ _kernel_tiled = mx.fast.metal_kernel(
 
 
 def _choose_n_tiles(T_cache: int, min_tile_size: int = 16, max_tiles: int = 256) -> int:
-    """Heuristic tile count: enough tiles to give the GPU real parallelism at
-    long context, without over-splitting short contexts into tiles too small
-    to be worth their own threadgroup's fixed overhead.
+    """Default tile count for a cache of length T_cache.
 
-    Benchmarked (Qwen2.5-0.5B dims, M4): this default gives 0.48-0.95x native
-    SDPA at short-to-medium context (T<=2048) — a large improvement over the
-    untiled v2 kernel's 0.06-0.16x at the same sizes — and *exceeds* native
-    SDPA from T=4096 onward (1.03x-1.13x, measured up to T=16384), which is
-    exactly the long-context regime this kernel's "never materialize
-    full-precision KV" design point matters most for.
+    Enough tiles to keep the GPU busy at long context, without splitting short
+    contexts into tiles too small to pay for a threadgroup.
     """
     if T_cache <= min_tile_size:
         return 1
@@ -205,21 +153,18 @@ def fused_quantized_attention_decode(
     v_scales: mx.array,
     n_tiles: int | None = None,
 ) -> mx.array:
-    """Fused decode-phase attention over an int8-quantized KV cache.
+    """Attention for one decode step over an int8-quantized KV cache.
 
     Args:
-        q:        [B, n_heads, head_dim] float32 — single decode-step query
-                  (T_q=1 already squeezed out by the caller).
+        q:        [B, n_heads, head_dim] float32 query (one token).
         k_codes:  [B, n_kv_heads, T_cache, head_dim] int8.
         k_scales: [B, n_kv_heads, T_cache] float32.
         v_codes:  [B, n_kv_heads, T_cache, head_dim] int8.
         v_scales: [B, n_kv_heads, T_cache] float32.
-        n_tiles:  number of T_cache chunks to split across threadgroups
-                  (v3's tiling parameter — see module docstring). Defaults to
-                  a heuristic based on T_cache if not given.
+        n_tiles:  number of tiles along T_cache; defaults to `_choose_n_tiles`.
 
     Returns:
-        [B, n_heads, head_dim] float32 attention output (pre-o_proj).
+        [B, n_heads, head_dim] float32 attention output (before o_proj).
     """
     B, n_heads, head_dim = q.shape
     n_kv_heads = k_codes.shape[1]
