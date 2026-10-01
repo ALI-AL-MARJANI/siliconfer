@@ -1,287 +1,344 @@
 # siliconfer
 
-> A **from-scratch 4-bit LLM inference engine** for Apple Silicon — no quantization library, no vendor kernel.
+A 4-bit LLM inference engine for Apple Silicon, written from scratch: GPTQ, AWQ
+and two calibration-free quantizers; a C++/NEON int4 kernel; a decoder with KV
+cache, int8 cache quantization and speculative decoding — with every reported
+number backed by a file in [`results/`](results/).
 
-**Thesis:** int4 quantization keeps perplexity ≈ fp16 while cutting weight memory ~4× and speeding up bandwidth-bound decode.
+[![CI](https://github.com/ALI-AL-MARJANI/siliconfer/actions/workflows/ci.yml/badge.svg)](https://github.com/ALI-AL-MARJANI/siliconfer/actions/workflows/ci.yml)
+![Python](https://img.shields.io/badge/Python-3.11+-blue)
+![Platform](https://img.shields.io/badge/Platform-Apple%20Silicon-black)
 
-![Python](https://img.shields.io/badge/Python-3.11+-blue?logo=python&logoColor=white)
-![Platform](https://img.shields.io/badge/Platform-Apple%20Silicon-black?logo=apple)
-![Tests](https://img.shields.io/badge/Tests-193%20passing-brightgreen)
-![License](https://img.shields.io/badge/License-MIT-blue)
-![Stack](https://img.shields.io/badge/Stack-MLX%20%7C%20NEON%20%7C%20Metal%20%7C%20C%2B%2B17-orange)
+## TL;DR
 
----
+<!-- PPL_TLDR -->
+| WikiText-2 test perplexity, context 2048 | fp16 | RTN | AWQ + block loss + clip | GPTQ | MLX `mx.quantize` (reference) |
+|---|---|---|---|---|---|
+| symmetric grid, 4.25 bits/weight | 13.02 | 18.16 | 15.22 ± 0.06 | **14.48 ± 0.01** | — |
+| asymmetric grid, 4.5 bits/weight | — | 15.44 | 14.55 ± 0.02 | **14.02 ± 0.02** | 15.52 |
+
+Source: `results/ppl_full/` (whole test split: 145 windows, 296,960 scored
+tokens; ± is the standard deviation over 3 calibration seeds). Best int4
+configuration: GPTQ on an asymmetric grid, +1.00 perplexity over fp16.
+<!-- /PPL_TLDR -->
+
+| | fp16 | int4, NEON kernel (CPU) | int4, MLX quantized matmul (GPU) |
+|---|---|---|---|
+| Weight memory | 988 MB | 463 MB (2.1× smaller) | 474 MB (2.1× smaller) |
+| Decode, tok/s, p50 (p10–p90), 128-token prompt | 77.3 (76.8–77.7) | 26.3 (26.0–26.3) | 89.6 (78.0–101.3) |
+| Decode, tok/s, p50 (p10–p90), 2048-token prompt | 70.3 (69.9–70.5) | 25.1 (24.8–25.2) | 99.3 (98.9–99.6) |
+
+Source: `results/bench/decode_Qwen2.5-0.5B.json` (10 runs of 256 greedy tokens
+after one warm-up). External reference on the same machine and model, from
+`results/bench/decode_mlx_lm_reference_Qwen2.5-0.5B.json`: mlx-lm bf16
+93.0 tok/s, mlx-lm 4-bit 186.1 tok/s (128-token prompt).
+
+**Setup:** Qwen2.5-0.5B (494 M parameters); MacBook, Apple M4, 16 GB; MLX
+0.31.2; WikiText-2 test and a C4 validation subset, context 2048; 3 calibration
+seeds for GPTQ and AWQ.
+
+What these numbers do and do not show:
+
+- int4 halves the model's weight memory (the projections alone go from 716 MB
+  to 190 MB, 3.8×; the embedding/output head stays in fp16).
+- The same int4 weights run 1.1–1.4× faster than fp16 on the GPU backend, and
+  about 3× **slower** than fp16 through this repo's own NEON kernel, because
+  each of the 168 quantized layers then forces a GPU→CPU round trip per token.
+- mlx-lm's 4-bit path is about twice as fast as this repo's best path. It also
+  quantizes the embedding/output head, which this repo does not.
+
+## Motivation
+
+Single-stream decoding multiplies every weight matrix by one vector per
+token, so its cost is dominated by reading weights. Storing weights in 4 bits
+instead of 16 cuts that traffic and the memory footprint by up to 4×, at some
+cost in accuracy. This project implements the pieces needed to measure that
+trade-off end to end on a laptop — the quantizers, the packed format, the
+kernels and the decoder — rather than calling a quantization library.
+
+## Method
+
+```
+HF safetensors ──> fp16 reference decoder (checked against transformers)
+                         │
+          calibration (128 × 512 tokens, WikiText-2 train)      weights only
+                 │                    │                              │
+               GPTQ                  AWQ                   HQQ-style / SINQ-style
+                 └──────────┬─────────┴──────────────────────────────┘
+               packed int4 codes + per-group scales (+ zero-points, + input scales)
+                            │
+        Q4Linear ──┬── NEON kernel (CPU): threaded GEMV, tiled GEMM
+                   └── mx.quantized_matmul (GPU): same codes, converted losslessly
+                            │
+      decoder: RMSNorm · RoPE · GQA attention + KV cache (fp16 or int8) · SwiGLU · sampling
+```
+
+**Storage.** Group-wise int4: per (output row, group of 128 input columns)
+one float32 scale, optionally a zero-point; two codes per byte. 4.25
+bits/weight symmetric, 4.5 asymmetric.
+
+**Quantizers** (details and equations: [`docs/methods.md`](docs/methods.md)):
+
+| Method | Needs data | What it does | Departures from the reference |
+|---|---|---|---|
+| RTN | no | round to nearest | — |
+| GPTQ | yes | column-by-column rounding with inverse-Hessian error feedback | grid fixed from the original weights (the reference's `static_groups=True`); no activation ordering; WikiText-2 calibration |
+| AWQ | yes | per-input-channel scale `s = mean|x|^α`, α grid-searched | by default α is scored on one projection's output and no clipping; `--awq_block_loss --awq_clip` follow llm-awq; `1/s` is applied to the layer input instead of folded into the previous layer; [`docs/awq-vs-reference.md`](docs/awq-vs-reference.md) |
+| HQQ-style | no | per-group clip-range search minimising an `ℓ_p` (p = 0.7) reconstruction loss | **not the HQQ solver**: keeps HQQ's objective, replaces its half-quadratic iteration by a 4-candidate search |
+| SINQ-style | no | iterative per-column rescaling driven by relative reconstruction error | column scale only; the row scale is provably a no-op with per-(row, group) scales |
+
+**Kernels** ([`docs/kernels.md`](docs/kernels.md)). The NEON GEMV unpacks 32
+weights per 16 bytes with shifts, converts them to float32 and accumulates in
+eight independent FMA chains; products above 2¹⁹ weights are split across the
+performance cores. Prefill dequantizes one 1 MB row tile at a time and
+multiplies it with Accelerate `sgemm`. The GPU backend re-expresses the same
+codes in MLX's layout without re-quantizing.
+
+**Serving.** A Llama-style decoder in MLX (logits match `transformers` on
+Qwen2.5-0.5B: `tests/test_logit_parity.py`), with an optional int8 KV cache,
+a Metal kernel that computes decode-step attention directly on the int8 cache,
+and speculative decoding with standard rejection sampling
+([`docs/speculative.md`](docs/speculative.md)).
+
+## Experimental protocol
+
+Full description: [`docs/eval-protocol.md`](docs/eval-protocol.md).
+
+- **Model:** `Qwen/Qwen2.5-0.5B`. Quantized: the seven projections of each of
+  the 24 blocks. Not quantized: embedding/output head (tied), norms, biases.
+- **Perplexity:** non-overlapping 2048-token windows, float32 NLL.
+  WikiText-2 raw *test*, and a fixed sample of C4 *validation* chosen by a
+  seed that is independent of everything else (each result file stores a hash
+  of the scored tokens). Two tiers: *full* (whole WikiText-2 test split,
+  145 windows; 64 C4 windows) and *quick* (32,768 tokens each).
+- **Reference check:** this repo's float32 forward pass and `transformers`
+  give the same perplexity on the full WikiText-2 test split to within
+  2.7 × 10⁻⁷ (`results/ppl/fp16_reference_validation.json`).
+- **Calibration** (GPTQ, AWQ): 128 × 512 tokens from WikiText-2 *train*, three
+  seeds; results are mean ± sample standard deviation.
+- **Baselines:** RTN (simple); MLX's own quantizer `mx.quantize` applied to the
+  same layers, and mlx-lm for speed (external references).
+- **Speed:** otherwise idle machine, warm-up excluded, p50 with p10–p90.
+- **Hyper-parameters** are the script defaults; every result file records its
+  full configuration, git SHA, hardware and library versions.
 
 ## Results
 
-Benchmarked on **Qwen2.5-0.5B**, **M4 base (16 GB unified memory)**:
+All tables below are copied from [`results/SUMMARY.md`](results/SUMMARY.md),
+which `scripts/make_results_tables.py` generates from the raw files.
 
-| Method | WikiText-2 PPL | ΔPPL | Decode tok/s | Memory | Compression |
+### Perplexity
+
+<!-- PPL_TABLE -->
+Full tier — the whole WikiText-2 test split (145 windows, 296,960 scored
+tokens) and 64 C4 validation windows (131,072 tokens); `results/ppl_full/*.json`.
+Every run in a column was scored on the same tokens (the files record a hash).
+A quick tier on 32,768 tokens per dataset (`results/ppl/`) gives the same
+ordering; its table is in `results/SUMMARY.md`.
+
+![Perplexity cost by method](results/figures/ppl.png)
+
+| Method | Grid | Bits/weight | WikiText-2 PPL | Δ vs fp16 | C4 PPL | Δ vs fp16 | Seeds |
+|---|---|---|---|---|---|---|---|
+| fp16 (unquantized) | — | 16 | 13.02 | — | 15.70 | — | 1 |
+| RTN | sym | 4.25 | 18.16 | +5.14 | 22.29 | +6.60 | 1 |
+| RTN | asym | 4.50 | 15.44 | +2.42 | 18.68 | +2.98 | 1 |
+| SINQ-style column rescaling | sym | 4.25 | 16.60 | +3.58 | 20.08 | +4.38 | 1 |
+| SINQ-style column rescaling | asym | 4.50 | 14.94 | +1.92 | 17.94 | +2.25 | 1 |
+| AWQ (layer-output loss, no clip) | sym | 4.25 | 15.83 ± 0.02 | +2.81 | 18.78 ± 0.02 | +3.08 | 3 |
+| AWQ + block loss | sym | 4.25 | 15.62 | +2.60 | — | — | 1 |
+| AWQ + clip | sym | 4.25 | 15.41 | +2.39 | — | — | 1 |
+| AWQ + block loss + clip | sym | 4.25 | 15.22 ± 0.06 | +2.20 | 18.33 ± 0.02 | +2.63 | 3 |
+| AWQ + block loss + clip | asym | 4.50 | 14.55 ± 0.02 | +1.53 | 17.52 ± 0.02 | +1.82 | 3 |
+| HQQ-style clip search | asym | 4.50 | 15.43 | +2.42 | 18.67 | +2.98 | 1 |
+| GPTQ | sym | 4.25 | 14.48 ± 0.01 | +1.46 | 18.12 ± 0.02 | +2.43 | 3 |
+| GPTQ | asym | 4.50 | 14.02 ± 0.02 | +1.00 | 17.34 ± 0.02 | +1.65 | 3 |
+| MLX `mx.quantize` (external reference) | asym | 4.50 | 15.52 | +2.50 | 18.74 | +3.04 | 1 |
+| MLX `mx.quantize` (external reference), group 64 | asym | 5.00 | 14.86 | +1.84 | 17.83 | +2.13 | 1 |
+
+± is the sample standard deviation over calibration seeds; rows without ±
+have no random component. Bits/weight counts the 4-bit code plus the
+per-group float32 scale (and zero-point on asymmetric grids).
+
+What the table shows:
+
+- **The method ordering is the same on both datasets and both grids**:
+  GPTQ < AWQ with block loss and clipping < SINQ-style < RTN. The gaps
+  between adjacent methods are at least nine times the seed standard deviation.
+- **The grid matters as much as the method.** An asymmetric grid costs 0.25
+  bits per weight and halves RTN's perplexity increase (+5.14 → +2.42).
+  Asymmetric RTN is better than symmetric AWQ with default settings.
+- **Ablation of the two AWQ options** (WikiText-2; one seed each for the
+  single-option rows): block-output loss −0.21, clipping −0.42, both −0.61
+  relative to the default AWQ.
+- **The HQQ-style clip search does not improve on asymmetric RTN** (15.43 vs
+  15.44 on WikiText-2, 18.67 vs 18.68 on C4). With its conservative clip
+  thresholds it behaves like asymmetric RTN. It is kept as a
+  calibration-free asymmetric quantizer, not as an improvement.
+- **Against the external reference**: MLX's quantizer is asymmetric min/max
+  rounding, and lands next to this repo's asymmetric RTN (15.52 vs 15.44).
+  GPTQ and AWQ with both options beat it at the same bit-width; at group size
+  64 (5 bits/weight) it reaches 14.86, still behind asymmetric GPTQ at 4.5.
+- **Calibration is in-domain for WikiText-2.** On C4 the calibrated methods
+  keep their lead, with a larger increase for every method.
+<!-- /PPL_TABLE -->
+
+### Decode speed
+
+![Decode speed](results/figures/decode.png)
+
+| Configuration | Prompt | Decode tok/s p50 (p10–p90) | Prefill tok/s p50 | Weights MB |
+|---|---|---|---|---|
+| fp16 | 128 | 77.3 (76.8–77.7) | 2567 | 988 |
+| fp16 | 2048 | 70.3 (69.9–70.5) | 2475 | 988 |
+| int4, NEON | 128 | 26.3 (26.0–26.3) | 629 | 463 |
+| int4, NEON | 2048 | 25.1 (24.8–25.2) | 850 | 463 |
+| int4, MLX | 128 | 89.6 (78.0–101.3) | 1564 | 474 |
+| int4, MLX | 2048 | 99.3 (98.9–99.6) | 868 | 474 |
+| mlx-lm bf16 (reference) | 128 | 93.0 (92.6–95.3) | 2110 | — |
+| mlx-lm 4-bit (reference) | 128 | 186.1 (174.2–270.4) | 2342 | — |
+
+- The int4 GPU path is faster than fp16 at every prompt length, but its
+  spread at short prompts is wide (p10 78, p90 101 at 128 tokens), and its
+  prefill is slower than fp16's.
+- The NEON path is the slowest end to end although its kernel is the fastest
+  single product at this model's shapes (next table): the time goes to 168
+  forced evaluations and GPU↔CPU copies per token, not to the products.
+- This decoder is slower than mlx-lm even in fp16 (77 vs 93 tok/s), so part of
+  the gap to mlx-lm's 4-bit figure is the decode loop, not the quantization.
+
+### One matrix-vector product
+
+![GEMV](results/figures/gemv.png)
+
+`results/bench/gemv.json`; cold-cache p50, ms. Measured copy bandwidth on this
+machine: 85 GB/s with one process, 102 GB/s with four.
+
+| out × in | NEON int4, 1 thread | NEON int4, threaded | Accelerate fp32 | MLX fp16 (GPU) | MLX 4-bit (GPU) |
 |---|---|---|---|---|---|
-| fp16 (MLX) | 18.96 | — | 18.2 | 988 MB | 1× |
-| RTN-int4 | 25.94 | +6.98 | 14.2 | 463 MB | 2.1× |
-| **GPTQ-int4** | **21.34** | **+2.38** | 14.4 | 463 MB | **2.1×** |
-| AWQ-int4 | 34.87 | +15.91 | 14.4 | 463 MB | 2.1× |
-| HQQ-int4 | 22.62 | +3.66 | 13.3 | 474 MB | 2.1× |
-| SINQ-int4 | 28.68 | +9.72 | 14.4 | 463 MB | 2.1× |
+| 896 × 896 | 0.060 | 0.029 | 0.045 | 0.242 | 0.200 |
+| 4864 × 896 | 0.312 | 0.099 | 0.240 | 0.337 | 0.252 |
+| 4096 × 4096 | 1.200 | 0.354 | 0.975 | 0.654 | 0.343 |
+| 14336 × 4096 | 4.202 | 1.143 | 3.443 | 1.494 | 0.652 |
 
-HQQ needs **zero calibration data** and still clearly beats RTN and AWQ, landing
-close to GPTQ (which needs a full Hessian calibration pass). Getting an honest number
-here took a real fix along the way: the first version of `Q4Linear`'s packer only
-supported symmetric requantization, silently corrupting HQQ's inherently-asymmetric
-output — measured PPL 31.55 before the fix (vs. 22.62 after). Added the missing
-asymmetric NEON prefill kernel (`gemm_asym`) and zero-point storage in `Q4Linear`;
-re-verified end-to-end on the real model afterward. (HQQ's memory footprint is
-slightly higher than the other methods' — 474 MB vs 463 MB — because asymmetric
-packing stores an extra zero-point per group.)
+- Threaded, the int4 kernel is 2.4× faster than Accelerate fp32 at the
+  0.5B MLP shape and 3.0× at a 7B-class shape; single-threaded it is slower
+  than Accelerate at every shape.
+- It reads 23–27 GB/s of packed weights with four threads, about a quarter of
+  the measured copy bandwidth: it is limited by unpacking nibbles to floats,
+  not by memory.
+- At the 7B-class shape MLX's 4-bit GPU product is 1.8× faster than this
+  kernel.
 
-**SINQ underperforms RTN in this table** (Δ+9.72 vs Δ+6.98) — a real result, not
-cherry-picked around: under a *different*, longer evaluation context
-(`scripts/quantize.py`'s default `seq_len=2048` vs this table's `seq_len=512`),
-SINQ actually beats RTN (Δ+3.20 vs Δ+4.46). Both numbers are real and reproducible;
-they just disagree on ranking, because different methods' quality degrades by very
-different amounts under shorter-context evaluation — checked across all five
-methods, not assumed: RTN's Δ only grows 1.57x going from seq_len=2048 to 512, HQQ's
-1.67x, GPTQ's 2.18x, SINQ's 3.04x, and **AWQ's 6.49x** (the largest by far — AWQ was
-already the weakest method here, see below). So this isn't a SINQ-specific problem;
-some methods are simply more sensitive to evaluation context length than others, and
-SINQ is the second-most sensitive of the five. See `CLAUDE.md §9`/`NOTES.md §13` for
-the full numbers and the standing rule not to mix PPL figures from the two
-evaluation scripts in one table.
+### Other measurements
 
-Projection weights alone: **190 MB vs 748 MB fp16 = 3.9× compression**.
-NEON kernel microbenchmark (simulated 7B decode): **4.1× speedup over fp16 numpy**.
-KV-cache int8 quantization: **~1.9× cache memory reduction**, PPL 17.13→18.34 (Δ+1.2)
-via true incremental decode on real WikiText-2 text — safer than RTN's weight-only
-degradation. Fused quantized-attention Metal kernel: after two honestly-slower
-iterations, real flash-attention-style tiling made it **1.03-1.13× faster than
-native SDPA at T=4096-16384 context** — see §14 below.
+| Claim | Result | Source |
+|---|---|---|
+| int8 KV cache, quality | PPL 17.88 → 18.56 through real incremental decode: +0.68 (paired bootstrap 95% CI +0.47 to +0.86), 4,088 tokens | `results/claims/kv_cache.json` |
+| int8 KV cache, memory | 25.2 → 13.4 MB at 2,048 cached tokens (1.88×, analytic) | same |
+| Fused int8-KV attention (Metal) vs dequantize + MLX attention | 0.44–0.89× (slower) up to 2,048 cached tokens; 1.04–1.10× (faster) from 4,096 to 16,384 | `results/bench/metal_attention.json` |
+| Fused int8-KV attention vs MLX attention on an unquantized fp16 cache | 0.41–0.66× (slower) at every length | same |
+| Speculative decoding, distribution | chi-square against the exact target distribution over 20,000 samples: p = 0.51 / 0.52 (tokens 2 and 3), 0.12 (joint); the plain-sampling control gives 0.55 / 0.17 / 0.51 | `results/claims/speculative.json` |
+| Speculative decoding, int4 draft of the same model | acceptance 0.79 ± 0.09 (greedy), 0.46 ± 0.05 (temperature 1); 0.82× and 0.56× the plain decode speed, i.e. slower | same |
+| Time to first token after `warmup()` | fp16 51 → 23 ms (2.2×); int4 MLX 36 → 21 ms (1.7×); int4 NEON 128 → 110 ms (1.2×) | `results/bench/ttft.json` |
+| Draft head (one block on fused target features), top-1 next-token accuracy | 23.3% ± 0.4% over 3 seeds; the target model scores 39.7% on the same tokens | `results/claims/draft_head.json` |
+| Mixed precision, 5 of 24 blocks demoted (fake-quant) | to 2 bits: PPL 46.62; to 3 bits: PPL 17.96; fp16 12.63 (32,768-token protocol) | `results/claims/mixed_precision_*.json` |
 
----
+Negative and null results:
 
-## What's inside
+- **The fused Metal attention kernel does not beat MLX attention on an
+  uncompressed cache** at any length tested. Its only win is over
+  dequantizing the int8 cache first, and only beyond 4,096 cached tokens.
+- **Speculative decoding gives no speedup here.** The only draft evaluated
+  costs as much as the target. The mechanism is correct (see the distribution
+  check) and unproven as an accelerator.
+- **The draft head is not good enough to be a draft model** and is not
+  connected to the speculative loop.
+- **Mixed precision does not pay at this model size.** Demoting 5 of 24
+  blocks to 2 bits gives PPL 46.6. Demoting them to 3 bits gives 18.0, against
+  14.97 for the same quantizer at a uniform 4 bits (same 32,768-token protocol,
+  `results/ppl/hqq_wikitext2_seq2048.json`), for a model
+  about 5% smaller.
 
-Three pillars, all implemented from first principles. `NOTES.md` has the full
-math derivations plus five debugging deep-dives worth reading if you like this
-kind of thing: a single "super weight" that took WikiText-2 PPL from 12 to 10,000+
-(§10), an algebraic proof that a promising-looking speculative-decoding shortcut is
-provably *not* lossless (§11), a kernel bug that silently corrupted every
-asymmetric-quantization method until a real fix — not a documented caveat — closed
-it (§12), a proof that half of a "dual-scale" quantization paper's own
-mechanism is a no-op in this codebase's baseline, plus the one-line fix (absolute
-→ relative error) that took the other half from a 3% win to a 98% one (§13), and
-the Metal kernel story below (§14): diagnosed correctly, failed twice, then
-succeeded on the third attempt by acting on the diagnosis instead of re-polishing
-what was already optimized.
+## Limitations and threats to validity
 
-### 1 — Quantization math
+- **One small model.** Everything is measured on a 0.5B model. At this size
+  per-call overheads matter as much as memory traffic; conclusions about
+  speed may not transfer to larger models, where a second size was planned
+  but not run (see `RUNBOOK.md`).
+- **In-domain calibration.** GPTQ and AWQ are calibrated on WikiText-2 train
+  and evaluated on WikiText-2 test. The C4 column is the out-of-domain check.
+- **Perplexity only.** No downstream task evaluation.
+- **Not validated against reference implementations numerically.** The
+  quantizers follow the papers with the listed departures; no layer-by-layer
+  comparison against llm-awq, GPTQModel or the HQQ library was run. "HQQ-style"
+  and "SINQ-style" share the objective or the idea of those methods, not
+  their algorithm.
+- **The embedding/output head is not quantized** (27% of the parameters), so
+  whole-model compression is 2.1×, not 4×.
+- **The serving path that is fast uses MLX's kernel**, not this repo's. The
+  NEON kernel is fast per product and slow end to end; a decode loop that
+  stays on the CPU has not been written.
+- **Non-overlapping windows.** Perplexities are not comparable with
+  sliding-window numbers from other sources.
+- **No comparison with llama.cpp.**
 
-**RTN** — naive round-to-nearest baseline.
+## Reproduce
 
-**GPTQ** (Frantar et al. 2022) — Hessian-weighted error propagation across weight columns:
-
-```
-H = 2·X·Xᵀ             calibration Hessian (shared across rows)
-H += λ·mean(diag H)·I   dampen for invertibility (λ ≈ 0.01)
-U = upper_cholesky(H⁻¹) ← upper Cholesky of inverse, NOT H⁻¹ directly
-
-For each column q (left → right):
-  quantize W[:,q] → Q[:,q]
-  W[:,rest] -= ((W[:,q] - Q[:,q]) / U[q,q]) · U[q, rest]
-```
-
-Key detail: `U[q,q]` is the Schur-complement diagonal (conditional), not `H⁻¹[q,q]` (unconditional). Using the wrong one was a bug caught during implementation.
-
-**AWQ** (Lin et al. 2023) — activation-aware channel scaling:
-
-```
-Y = W·X = (W·diag s)·(diag(s⁻¹)·X),   s = act_scale^α
-
-Quantize W·diag(s)  → smaller error on high-activation channels
-Fold diag(s⁻¹) into the preceding RMSNorm → zero runtime cost
-```
-
-**HQQ** (Badri & Shaji 2023) — calibration-free, robust to weight outliers:
-
-```
-For each group, search candidate clip ranges [median ± k·MAD] (k from a fixed grid,
-k=∞ = plain min-max RTN); keep whichever minimizes the ACTUAL quantized
-(round+clip+dequant) L_p loss (p=0.7, hyper-Laplacian).
-```
-
-No activations needed — only the weight tensor. Validating against real weights
-surfaced a genuine "super weight" (Yu et al. 2024): a single lone outlier at robust
-z-score ≈58 in one `down_proj` group that, if clipped, corrupted a residual-stream
-channel enough to blow WikiText-2 PPL from ~12 to 10,000+. Magnitude statistics alone
-can't tell "safe to compress" apart from "structurally critical" — the default
-`k_grid` is set conservative enough that no plausible real super-weight gets caught.
-
-**SINQ** (dual-scale-inspired, Sept 2025) — calibration-free, iterative column rescaling:
-
-```
-s = ones(in_features)
-repeat: W' = W·diag(s);  quantize W' per-(row,group) as usual;  undo the scale
-        rel_err[j] = RMS(W[:,j]-W_eff[:,j]) / RMS(|W[:,j]|)     ← RELATIVE, not absolute
-        s *= (rel_err / mean(rel_err))^β                        ← crushed columns get more room
-```
-
-The real SINQ paper also fits a *row*-scale. Proven algebraically (and confirmed to
-float64 machine epsilon) that a row-scale is a no-op here specifically: this
-codebase's group-wise quantizer already computes an independent max-based scale per
-*(output row, group)*, so any row-wise pre-scaling cancels out exactly before it can
-help. What's shipped is honestly the column-scale half — a calibration-free
-companion to AWQ, using the weight's own per-column magnitude spread instead of real
-activation statistics. Getting the update signal right mattered a lot: a first
-version using *absolute* reconstruction error as the correction signal only improved
-~3% over plain RTN on a column-outlier test, because absolute error is roughly
-uniform across columns sharing one group's quantization step regardless of magnitude
-— switching to *relative* error took the same test to ~98% MSE reduction on the
-crushed columns.
-
-All five methods use **group-wise int4** (group size 128): two nibbles per byte, one fp32 scale per group (+ zero-point for asymmetric methods).
-
-**Mixed 2/4-bit (and 3/4-bit) precision** (`quant/mixed_precision.py`,
-CoopQ-inspired) — a from-scratch permutation-sampling Shapley-value estimator
-(checked against closed-form ground truth for both additive and
-pairwise-interaction games, not just "does it run") ranks each transformer
-block's sensitivity, then demotes the least-sensitive blocks under a memory
-budget (an exact top-k selection here, since every block in this architecture
-has identical size). HQQ was generalized to run its outlier-aware clip-range
-search at any bit-width (`quantize_sym_n`/`quantize_asym_n` in
-`quant/primitives.py`), not just plain RTN, after a real-model check found
-plain RTN-int2 catastrophically lossy (PPL 500,000+ demoting the whole
-network) regardless of which blocks were chosen. Honest, scale-dependent
-result: **2-bit is never a good tradeoff** vs uniform HQQ-int4 at this model's
-size, even with the best selection + algorithm this session could produce
-(Shapley selection beats uniform demotion by ~437x, HQQ-int2 beats RTN-int2 by
-~30-2.5x, but the floor is still too low). **3-bit is a different, genuinely
-useful story**: demoting the same 5 (of 24) least-sensitive blocks to 3-bit
-instead of 2-bit cuts PPL degradation by ~2.6x (25.33 vs 65.65) for a smaller
-memory saving — a real, modest compression bonus on top of uniform int4. See
-NOTES.md §15-16 for the full numbers; not shipped as a served (packed-kernel)
-method yet — see § 3 below.
-
----
-
-### 2 — ARM NEON kernel
-
-Hand-written C++17 GEMV (single-token decode) + GEMM (prefill), compiled with pybind11.
-
-Weight layout: low nibble = even column, hi nibble = odd column.
-Inner loop over 16 packed bytes (32 int4 values):
-
-```cpp
-uint8x16_t packed = vld1q_u8(w_ptr);
-int8x16_t lo = vshrq_n_s8(vshlq_n_s8(vreinterpretq_s8_u8(packed), 4), 4); // even cols
-int8x16_t hi = vshrq_n_s8(vreinterpretq_s8_u8(packed), 4);                 // odd cols
-// vuzpq_f32 deinterleaves even/odd after int→float, then fused multiply-accumulate
-```
-
-The `(x<<4)>>4` shift trick sign-extends nibbles in 2 NEON instructions with no branches.
-Python falls back to a NumPy reference if the `.so` isn't built.
-
-**Why decode speeds up (roofline):**
-
-```
-M4 unified bandwidth ≈ 120 GB/s
-
-fp16 GEMV: load n_weights × 2 bytes  →  60 B weights/s
-int4 GEMV: load n_weights × 0.5 byte →  240 B weights/s
-                                Theoretical speedup: 4×
-```
-
----
-
-### 3 — Serving loop
-
-Full Llama-style decoder built on MLX: `RMSNorm → RoPE → GQA attention (KV cache) → SwiGLU MLP`.
-
-`Q4Linear` replaces every projection with NEON-backed int4 matmul; MLX only tracks attention and norms — packed weight bytes are invisible to its parameter tree.
-
-**Quantized KV cache** (`model/kv_cache.py`): group-wise int8, one scale per (batch, kv_head, token) vector — a KV vector has no natural sub-grouping to exploit int4's nibble-packing the way weight rows do, so int8 is the safer, still-real ~1.9× win. Implemented in native `mx.array` ops end-to-end (no numpy round-trip) since the cache is quantized on *every* decode step, not once at load time like weights — a numpy round-trip here would reproduce the CPU↔GPU sync bottleneck below, but per-token instead of per-model-load. Opt-in via `generate(..., quantize_kv_cache=True)` or `speculative_generate(..., quantize_kv_cache=True)` (composes with dynamic K too).
-
-**Fused quantized-attention Metal kernel** (`kernels/metal/q4_attention.py`): closes a real, confirmed-absent gap — MLX has no first-class quantized-KV `scaled_dot_product_attention` as of this writing. Dequantizes int8 K/V inline via a hand-written `mx.fast.metal_kernel`, running a numerically-stable online softmax (`metal::precise::exp`, not the fast-math default, which doesn't guarantee `exp(-INFINITY)==0`) so the cache is never materialized to full precision for a decode step.
-
-Three iterations, all verified to float32 machine-epsilon precision against the reference path before any performance claim: **v1** (one thread per head) was 4-30× *slower* than native SDPA; **v2** (threadgroup-parallel across `head_dim`) improved to 6-16× slower but still only launched `B×n_heads` threadgroups regardless of context length — the actual bottleneck. **v3** fixes that directly: real flash-attention-style tiling splits the cache into `n_tiles` chunks, launches `B×n_heads×n_tiles` threadgroups, and merges each chunk's partial (un-normalized) online-softmax result with the standard flash-attention combine rule — a few cheap native `mx.array` ops, no second kernel dispatch. Result: **0.48-0.95× native SDPA at T=128-2048, and 1.03-1.13× (genuinely faster) from T=4096 to T=16384** — exactly the long-context regime this kernel's whole design point (never materialize full-precision KV) matters most for. This was the explicit "already failed twice, high-risk" item on this project's own todo list; it paid off on the third attempt by targeting the bottleneck Phase 9c had already correctly diagnosed but not yet acted on, rather than re-polishing what was already optimized.
-
-**Speculative decoding** (`engine/speculative.py`): a small draft model proposes K tokens; the target verifies K+1 in one forward pass. Rejection sampling (`accept with prob min(1, p_target/p_draft)`) is provably lossless — with draft=target and greedy decoding, output matches non-speculative exactly (verified by test). **Dynamic speculation depth** adapts K round-to-round (deeper after full acceptance, shallower after an early rejection) — exactly lossless by construction, since K never appears in the accept/reject correctness proof. A more ambitious multi-candidate retry scheme was attempted first and rejected: proved algebraically that it requires negative fallback probabilities for retry counts ≥ 2, i.e. it's provably *not* lossless — kept as a documented, tested negative finding rather than shipped.
-
-**EAGLE-3-inspired draft head** (`model/draft_head.py`, `engine/draft_training.py`) — a real, trained (not just architected) scaled-down version of EAGLE's actual design: multi-layer feature fusion from 3 target depths, one `TransformerBlock` at the target's own hidden width, and the target's own frozen embedding/LM head reused rather than trained from scratch (matching EAGLE's real architecture, not a simplification invented here). Trained via real supervised distillation on Qwen2.5-0.5B + WikiText-2 (full-sequence teacher forcing, not the paper's multi-step rollout simulation), now with proper early stopping and best-checkpoint restore. Honest result across three data scales: top-1 next-token accuracy climbed **4.9% → 17.9% → 20.6%** (40 → 150 → 250 training sequences) — real, consistent learning, never regressing — but the gains are clearly diminishing (+13.0 points, then only +2.6), well short of the target's own ~40% top-1 and not obviously closing that gap with modestly more of the same data (the real EAGLE-3 uses 500K+ distilled examples). Full `speculative_generate` integration is deferred rather than forced — see NOTES.md §16.3 for why, plus a real debugging detour along the way: an apparent training stall at 1000 sequences turned out to be genuine system memory pressure on this shared 16GB machine, not a code bug (confirmed via `vm_stat`, not guessed).
-
-**TTFT pre-warming** (`engine/generate.py::warmup`, `--warmup` in `scripts/run.py`): runs a throwaway prefill-shape and decode-shape forward pass to trigger MLX's lazy-graph compilation before a real request. Confirmed a real, measurable **1.38× first-token speedup on the plain fp16 path** (77.4ms → 56.0ms) — but only ~1.04× (noise-level) on the actual quantized `Q4Linear` serving path, because that path already forces an eager `mx.eval()` per layer to bridge to the NEON kernel, leaving little lazy graph left to warm. Reported as measured, not assumed to help just because the underlying phenomenon is real.
-
----
-
-## Quickstart
+[`RUNBOOK.md`](RUNBOOK.md) has the exact commands, durations and hardware.
 
 ```bash
-# Install
+python3.11 -m venv .venv && source .venv/bin/activate
 pip install -e ".[dev]"
-
-# Build NEON kernel (macOS, requires clang++)
 bash siliconfer/kernels/neon/build_kernel.sh
+python -m pytest tests -q
 
-# Tests — 193 fast unit + integration tests (~3s, no model needed)
-pytest tests/
-
-# Full suite including logit-parity vs HuggingFace (requires Qwen2.5-0.5B in cache)
-pytest tests/ --run-integration
-
-# Interactive generation (add --method hqq/sinq for calibration-free quant,
-# --quantize_kv_cache for int8 KV cache)
-python scripts/run.py \
-    --model_id Qwen/Qwen2.5-0.5B \
-    --method gptq \
-    --prompt "Explain attention in transformers:" \
-    --max_tokens 200
-
-# Speculative decoding, with dynamic speculation depth (see "What's inside" below)
-python scripts/run.py \
-    --model_id Qwen/Qwen2.5-0.5B \
-    --speculative --dynamic_K \
-    --prompt "The theory of relativity states that"
-
-# TTFT pre-warming (warms MLX's lazy graph before the timed request)
-python scripts/run.py \
-    --model_id Qwen/Qwen2.5-0.5B --warmup \
-    --prompt "The theory of relativity states that"
-
-# Mixed 2/4-bit precision PPL comparison (algorithm-level only — no packed-kernel
-# serving yet, see NOTES.md §15)
-python scripts/quantize.py --model_id Qwen/Qwen2.5-0.5B --method mixed \
-    --mixed_budget_ratio 0.9 --mixed_permutations 8
-
-# Full benchmark matrix (fp16 + RTN + GPTQ + AWQ + HQQ + SINQ, ~25 min)
-python scripts/run_benchmarks.py \
-    --model_id Qwen/Qwen2.5-0.5B \
-    --full --ppl --max_ppl_tokens 5000
+bash scripts/run_ppl_matrix.sh            # perplexity, quick tier
+FULL=1 bash scripts/run_ppl_matrix.sh     # perplexity, full tier
+bash scripts/run_all_benchmarks.sh        # speed + per-claim evaluations
+python scripts/make_results_tables.py && python eval/plots.py
 ```
 
----
+Generate text:
 
-## Repository layout
+```bash
+python scripts/run.py --model_id Qwen/Qwen2.5-0.5B --method gptq --backend mlx \
+    --prompt "Explain attention in transformers:" --max_tokens 200
+```
+
+## Repository
 
 ```
 siliconfer/
-├── siliconfer/
-│   ├── model/          # config, llama blocks, RoPE, RMSNorm, GQA attention, kv_cache.py, draft_head.py
-│   ├── quant/          # primitives, rtn.py, gptq.py, awq.py, hqq.py, sinq.py, mixed_precision.py, calibration.py
-│   ├── kernels/
-│   │   ├── neon/       # q4_gemv.cpp, q4_gemm.cpp, pybind11 bindings, CMakeLists.txt
-│   │   └── metal/      # q4_attention.py — fused quantized-attention mx.fast.metal_kernel
-│   ├── engine/         # generate.py (incl. warmup()), q4_loader.py, speculative.py, draft_training.py
-│   └── eval/           # perplexity.py, bench.py
-├── eval/               # plots.py (PPL bar, throughput bar, memory bar, roofline)
-├── scripts/            # run.py, quantize.py, benchmark.py, run_benchmarks.py
-└── tests/              # 193 unit + integration tests
+├── model/      config, decoder blocks, RoPE, attention, kv_cache.py, q4_linear.py, draft_head.py
+├── quant/      primitives, rtn, gptq, awq, hqq, sinq, mixed_precision, calibration
+├── kernels/
+│   ├── neon/   q4_gemv.cpp, q4_gemm.cpp, pybind11 bindings, build script
+│   └── metal/  q4_attention.py (fused int8-KV attention)
+├── engine/     generate, q4_loader, speculative, draft_training
+└── eval/       perplexity, bench, env_info
+scripts/        eval_ppl, run_ppl_matrix.sh, bench_*, eval_*, run_all_benchmarks.sh,
+                make_results_tables, run, quantize
+eval/plots.py   figures from results/
+results/        raw JSON per run, SUMMARY.md, figures/
+docs/           methods, kernels, packing, speculative, eval-protocol,
+                awq-vs-reference
+tests/          pytest; fast tests need no model download
 ```
 
----
+Tests: `python -m pytest tests -q` (no download), plus `--run-integration` for
+the tests that need the model. CI runs lint and the fast tests on an Apple
+Silicon runner.
 
-## Stack
+## References
 
-- **Python 3.11+**, **MLX** (Apple array framework), **NumPy**
-- **C++17 + ARM NEON intrinsics**, **pybind11**, CMake
-- **Metal Shading Language** via `mx.fast.metal_kernel` — custom fused attention kernel
-- **PyTorch / HuggingFace** — reference baselines only
-- **Hardware:** MacBook M4 base · 16 GB unified memory · ARMv9.2a (NEON + I8MM + SME2)
+- Frantar et al., *GPTQ: Accurate Post-Training Quantization for Generative Pre-trained Transformers*, [arXiv:2210.17323](https://arxiv.org/abs/2210.17323); code [IST-DASLab/gptq](https://github.com/IST-DASLab/gptq).
+- Lin et al., *AWQ: Activation-aware Weight Quantization for LLM Compression and Acceleration*, [arXiv:2306.00978](https://arxiv.org/abs/2306.00978); code [mit-han-lab/llm-awq](https://github.com/mit-han-lab/llm-awq).
+- Badri & Shaji, *Half-Quadratic Quantization of Large Machine Learning Models* (Mobius Labs, 2023); code [mobiusml/hqq](https://github.com/mobiusml/hqq).
+- *SINQ: Sinkhorn-Normalized Quantization for Calibration-Free Low-Precision LLM Weights* (2025).
+- Yu et al., *The Super Weight in Large Language Models*, [arXiv:2411.07191](https://arxiv.org/abs/2411.07191).
+- Leviathan et al., *Fast Inference from Transformers via Speculative Decoding*, [arXiv:2211.17192](https://arxiv.org/abs/2211.17192).
+- Chen et al., *Accelerating Large Language Model Decoding with Speculative Sampling*, [arXiv:2302.01318](https://arxiv.org/abs/2302.01318).
+- Li et al., *EAGLE-3: Scaling up Inference Acceleration of Large Language Models via Training-Time Test*, [arXiv:2503.01840](https://arxiv.org/abs/2503.01840).
+- Liu et al., *KIVI: A Tuning-Free Asymmetric 2bit Quantization for KV Cache*, [arXiv:2402.02750](https://arxiv.org/abs/2402.02750).
+- [MLX](https://github.com/ml-explore/mlx) and [mlx-lm](https://github.com/ml-explore/mlx-lm).
