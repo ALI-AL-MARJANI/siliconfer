@@ -14,16 +14,16 @@ Build the extension:
 
 from __future__ import annotations
 
-import importlib
-import sys
 import pathlib
+import sys
+
 import numpy as np
 
 # Try to import the compiled extension from this package directory
 _HERE = pathlib.Path(__file__).parent
 sys.path.insert(0, str(_HERE))
 try:
-    from . import siliconfer_neon as _lib   # compiled .so
+    from . import siliconfer_neon as _lib  # compiled .so
     NEON_AVAILABLE = _lib.neon_available()
     _BACKEND = "neon" if NEON_AVAILABLE else "scalar-c"
 except ImportError:
@@ -79,6 +79,41 @@ def pack_weights_asym(
     hi = W_q[:, 1::2].astype(np.uint8) & 0x0F
     packed = (lo | (hi << 4)).astype(np.uint8)
     return packed, scales, zeros
+
+
+def pack_weights_on_grid(
+    W_q: np.ndarray,
+    scales: np.ndarray,
+    zeros: np.ndarray | None = None,
+    group_size: int = 128,
+) -> np.ndarray:
+    """Pack an already-quantized weight using the grid it was quantized on.
+
+    `pack_weights_sym/asym` derive the grid from the weight (group maximum, or
+    min/max). That recovers the original grid only when every group's largest
+    code is ±7 (or its codes span 0..15). GPTQ fixes the grid first and then
+    moves the weights, so a group can use code −8 or never reach ±7. With the
+    scales and zero-points that were actually used, the codes are recovered
+    exactly.
+
+    Args:
+        W_q:    float [out, in] quantized weight, (code − zero)·scale.
+        scales: float32 [out, n_groups].
+        zeros:  float32 [out, n_groups], or None for a symmetric grid.
+
+    Returns:
+        packed uint8 [out, in // 2], same layout as pack_weights_sym/asym.
+    """
+    sc = np.repeat(np.where(scales == 0, 1.0, scales).astype(np.float64), group_size, axis=1)
+    codes = np.round(W_q.astype(np.float64) / sc)
+    if zeros is None:
+        codes = codes.clip(-8, 7).astype(np.int8)
+    else:
+        codes = (codes + np.repeat(zeros.astype(np.float64), group_size, axis=1)).clip(0, 15)
+        codes = codes.astype(np.uint8)
+    lo = codes[:, 0::2].astype(np.uint8) & 0x0F
+    hi = codes[:, 1::2].astype(np.uint8) & 0x0F
+    return (lo | (hi << 4)).astype(np.uint8)
 
 
 # ---------------------------------------------------------------------------
@@ -204,14 +239,7 @@ def gemm_asym(
     X: np.ndarray,
     group_size: int = 128,
 ) -> np.ndarray:
-    """NEON q4 asymmetric GEMM: Y[T, out] = X[T, in] @ (W_q4 - zero).T * scale.
-
-    Prefill-path counterpart to `gemv_asym` (decode). Added to let Q4Linear
-    correctly serve asymmetrically-quantized weights (e.g. HQQ, which is
-    always asymmetric) instead of the pre-existing gap where every method got
-    silently re-packed as symmetric regardless of how it was actually
-    quantized — see CLAUDE.md §9.
-    """
+    """Asymmetric q4 GEMM: Y[T, out] = X[T, in] @ ((W_q4 − zero) · scale).T."""
     packed = np.ascontiguousarray(packed, dtype=np.uint8)
     scales = np.ascontiguousarray(scales, dtype=np.float32)
     zeros  = np.ascontiguousarray(zeros,  dtype=np.float32)
@@ -237,3 +265,41 @@ __all__ = [
     "gemm_sym",
     "gemm_asym",
 ]
+
+
+def dequant(
+    packed: np.ndarray,
+    scales: np.ndarray,
+    zeros: np.ndarray | None = None,
+    group_size: int = 128,
+) -> np.ndarray:
+    """Dequantize packed int4 weights to float32 [out, in]. zeros=None: symmetric."""
+    packed = np.ascontiguousarray(packed, dtype=np.uint8)
+    scales = np.ascontiguousarray(scales, dtype=np.float32)
+    if zeros is not None:
+        zeros = np.ascontiguousarray(zeros, dtype=np.float32)
+    if _lib is not None:
+        return _lib.q4_dequant(packed, scales, zeros, group_size)
+    lo = (packed & 0x0F).astype(np.float32)
+    hi = (packed >> 4).astype(np.float32)
+    if zeros is None:
+        lo, hi = np.where(lo >= 8, lo - 16, lo), np.where(hi >= 8, hi - 16, hi)
+    W = np.empty((packed.shape[0], packed.shape[1] * 2), dtype=np.float32)
+    W[:, 0::2], W[:, 1::2] = lo, hi
+    if zeros is not None:
+        W -= np.repeat(zeros, group_size, axis=1)
+    return W * np.repeat(scales, group_size, axis=1)
+
+
+def set_num_threads(n: int) -> None:
+    """Threads used by the compiled GEMV / dequantization (no-op without it).
+
+    Defaults to the number of performance cores. Products under 2**19 weights
+    always run on the calling thread.
+    """
+    if _lib is not None:
+        _lib.set_num_threads(int(n))
+
+
+def get_num_threads() -> int:
+    return _lib.get_num_threads() if _lib is not None else 1
