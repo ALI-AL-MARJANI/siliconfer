@@ -1,33 +1,23 @@
-"""Supervised distillation training for FeatureFusionDraftHead (EAGLE-3-style).
+"""Supervised distillation for FeatureFusionDraftHead.
 
-Real EAGLE-3 trains its draft head on 500K+ target-model rollouts (ShareGPT +
-UltraChat-200K) — confirmed via live research before building this, not
-assumed (see CLAUDE.md/NOTES.md). This module is an honestly small-scale
-version: enough real sequences from WikiText-2 to check whether the
-mechanism (multi-layer feature fusion + one small transformer block, reusing
-the target's own frozen embedding/LM head) can learn anything useful at all,
-not a claim of matching the paper's scale, data mixture, or results.
-
-Training is full-sequence teacher forcing (no autoregressive rollout needed
-at train time — the target's real hidden states and real next tokens are
-available for every position in one batched forward pass), which is both
-simpler and cheaper than the paper's "training-time test" multi-step rollout
-simulation; that's a real, named simplification, not something obscured.
+Teacher-forced on WikiText-2 sequences: the target's hidden states and the
+true next tokens are available for every position from one forward pass.
+EAGLE-3 trains on 500K+ rollouts with a multi-step objective; this is a
+small-scale check of whether the architecture learns at all.
 """
 
 from __future__ import annotations
 
 import time
 
-import numpy as np
 import mlx.core as mx
 import mlx.nn as nn
 import mlx.optimizers as optim
-
+import numpy as np
 from mlx.utils import tree_map
 
-from siliconfer.model.llama import LlamaModel
 from siliconfer.model.draft_head import FeatureFusionDraftHead
+from siliconfer.model.llama import LlamaModel
 
 
 def collect_distillation_example(
@@ -35,21 +25,11 @@ def collect_distillation_example(
     input_ids: mx.array,
     feature_layers: list[int],
 ) -> tuple[list[mx.array], mx.array]:
-    """Run target once (teacher forcing) and return (hidden_states, labels).
+    """Run the target once and return (hidden_states, labels).
 
-    hidden_states are stop-gradiented — they are frozen distillation targets;
-    nothing should ever backprop into the target model through them.
-
-    Explicitly evaluated (`mx.eval`) before returning: MLX builds its
-    computation graph lazily, so without this, "precomputing" examples ahead
-    of the training loop (see train_draft_head) would not actually compute
-    anything — it would just accumulate every example's full 24-layer target
-    forward pass as one large unevaluated graph, deferred until the training
-    loop happens to touch each one. Confirmed this was a real, not
-    theoretical, problem: a version without this eval() ran a 150-example,
-    40-epoch training job for many minutes with almost no CPU progress
-    (adding maybe 5-10s of CPU time per 5 minutes of wall clock — effectively
-    stalled) before being killed; forcing eager evaluation here fixed it.
+    The hidden states are stop-gradient and evaluated before returning: MLX is
+    lazy, so without the explicit `mx.eval` every example would stay an
+    unevaluated graph of the full target forward pass.
     """
     _, _, hidden_states = target(input_ids, feature_layers=feature_layers)
     hidden_states = [mx.stop_gradient(h) for h in hidden_states]
@@ -78,40 +58,15 @@ def train_draft_head(
     patience: int | None = None,
     verbose: bool = True,
 ) -> dict:
-    """Train draft_head's `fuse` + `block` + `norm` parameters via supervised
-    distillation. The target's embed_tokens/lm_head are shared but excluded
-    from the parameter tree (leading-underscore attributes — verified this is
-    how MLX's nn.Module actually behaves, not assumed) so they're never
-    updated by the optimizer, regardless of what forward_train computes
-    through them.
+    """Train the head's fusion projection and block by supervised distillation.
 
-    The target is frozen throughout training, so its hidden states for each
-    sequence are identical every epoch — precomputed once here rather than
-    re-run through the (much more expensive) full target model on every
-    epoch. This is the same class of fix as mixed_precision.py's
-    precompute-once optimization earlier this session (there: re-quantizing
-    all blocks per Shapley coalition; here: re-running target's forward pass
-    per training epoch) — confirmed worth doing before, not assumed
-    universally necessary, so worth re-applying deliberately rather than by
-    reflex.
+    The target is frozen, so its hidden states are computed once before the
+    first epoch. After every epoch that improves the validation loss the
+    parameters are copied; the best copy is restored at the end. With
+    `patience` set, training stops after that many epochs without improvement.
 
-    Early stopping / best-checkpoint selection: a first run at this scale
-    (150 sequences, 40 fixed epochs, no checkpointing) overfit past epoch 28
-    (val_loss rose from ~5.79 there to 6.39 by epoch 40, even as train_loss
-    kept dropping) — the reported result used whatever the last epoch left,
-    understating what the run's own best point could do. Fixed properly here,
-    not by picking a smaller fixed epoch count: after every epoch where
-    val_loss improves, snapshot draft_head's parameters (a real deep copy via
-    `tree_map(mx.array, ...)`, not a reference to the same live arrays the
-    optimizer keeps mutating); at the end, restore the best snapshot via
-    `draft_head.update(...)`. If `patience` is set, training also stops early
-    once `patience` consecutive epochs pass without a new best val_loss,
-    rather than always running the full `n_epochs` regardless of whether
-    it's still helping.
-
-    Returns a dict with per-epoch train/val loss history plus
-    `best_epoch`/`best_val_loss` (1-indexed; the checkpoint actually left on
-    `draft_head` after this function returns).
+    Returns a dict with the per-epoch train/val losses, `best_epoch` (1-indexed)
+    and `best_val_loss`.
     """
     draft_head.attach_target_embeddings(target)
     optimizer = optim.AdamW(learning_rate=lr)
@@ -185,15 +140,9 @@ def evaluate_top1_accuracy(
     sequences: list[mx.array],
     feature_layers: list[int],
 ) -> tuple[float, float]:
-    """Returns (draft_head_top1_acc, target_top1_acc).
+    """Return (draft_head_top1, target_top1) next-token accuracy on `sequences`.
 
-    target_top1_acc (the target's own top-1-vs-actual-next-token accuracy) is
-    reported alongside as a reference ceiling, not a bar the draft head is
-    expected to clear — it's a ~24-layer model conditioned on the full
-    sequence, the draft head is one layer conditioned on 3 borrowed feature
-    vectors. What matters is whether the draft head does meaningfully better
-    than chance / an untrained baseline, which is checked separately in
-    tests.
+    The target's own accuracy is given as a reference point.
     """
     correct_draft = 0
     correct_target = 0

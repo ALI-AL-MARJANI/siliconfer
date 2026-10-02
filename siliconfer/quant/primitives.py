@@ -143,12 +143,9 @@ def dequantize_asym(
 # ---------------------------------------------------------------------------
 # Symmetric int2 (range [-2, 1], zero-point = 0)
 #
-# Only one positive code (1) is available in 2-bit two's complement, so the
-# scale is set by the *positive* max even though the negative side reaches
-# further (-2) — the same "clip the wider side to match the narrower one"
-# tradeoff every symmetric scheme makes, just far more visible at 2 bits.
-# This is intentionally lossier than int4; it exists to be assigned only to
-# the layers a sensitivity estimate says can tolerate it (see mixed_precision.py).
+# 2-bit two's complement has a single positive code (1), so the scale is set
+# by the positive maximum even though the negative side reaches −2. Used only
+# by mixed_precision.py.
 # ---------------------------------------------------------------------------
 
 def quantize_sym_int2(
@@ -248,17 +245,10 @@ def dequantize_asym_int2(
 
 
 # ---------------------------------------------------------------------------
-# Generic arbitrary bit-width (2-8) — generalizes the sym/int2 pairs above.
+# Arbitrary bit-width (2-8)
 #
-# quantize_sym/quantize_sym_int2/quantize_asym/quantize_asym_int2 above are
-# kept as-is (existing tests reference them by name), but every quantize
-# function only differs from another by its clip range (q_max/q_min derived
-# from `bits`) — dequantize_sym/dequantize_asym are already bit-width-agnostic
-# (just `q * scale` / `(q - zero) * scale`, no reference to a specific range),
-# so they're reused unchanged. Added to let fake_quantize (and HQQ's
-# small-matrix fallback) support bits like 3, 5, 6 without a new named
-# function per width every time one is needed — see mixed_precision.py's
-# 3-bit low-tier experiment (NOTES.md) for why this came up.
+# The quantizers differ only in their code range, which follows from `bits`.
+# dequantize_sym / dequantize_asym do not depend on the range and are reused.
 # ---------------------------------------------------------------------------
 
 def quantize_sym_n(
@@ -268,8 +258,7 @@ def quantize_sym_n(
 ) -> tuple[np.ndarray, np.ndarray]:
     """Group-wise symmetric quantization at an arbitrary bit-width.
 
-    Equivalent to quantize_sym when bits=4 and quantize_sym_int2 when bits=2
-    (same formulas, parameterized instead of duplicated per width).
+    Equals quantize_sym at bits=4 and quantize_sym_int2 at bits=2.
     """
     if not (2 <= bits <= 8):
         raise ValueError(f"bits must be in [2, 8], got {bits}")
@@ -299,7 +288,7 @@ def quantize_asym_n(
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Group-wise asymmetric quantization at an arbitrary bit-width.
 
-    Equivalent to quantize_asym when bits=4 and quantize_asym_int2 when bits=2.
+    Equals quantize_asym at bits=4 and quantize_asym_int2 at bits=2.
     """
     if not (2 <= bits <= 8):
         raise ValueError(f"bits must be in [2, 8], got {bits}")
@@ -445,21 +434,13 @@ def fake_quantize(
     sym: bool = True,
     bits: int = 4,
 ) -> np.ndarray:
-    """Round-to-nearest fake-quant: quantize then immediately dequantize.
-
-    The returned array has the same shape and dtype as w but contains the
-    quantization error that RTN would introduce. Used to measure accuracy
-    before any actual packed kernel exists.
+    """Round-to-nearest quantization followed by dequantization.
 
     Args:
-        w: float32 array, shape (..., cols). cols must be divisible by group_size.
-        group_size: 64 or 128 are standard choices.
-        sym: if True use symmetric quant (zero-point = 0), else asymmetric.
-        bits: any width in [2, 8] (uses quantize_sym_n/quantize_asym_n — see
-            those for why arbitrary widths, not just 2/4, are supported).
-            Anything below 4 is only intended for layers a sensitivity
-            estimate (see mixed_precision.py) has marked as tolerant of the
-            extra error.
+        w: float32 array, shape (..., cols); cols divisible by group_size.
+        group_size: elements per quantization group (64 or 128 are typical).
+        sym: symmetric grid if True, asymmetric otherwise.
+        bits: bit-width in [2, 8].
 
     Returns:
         float32 array, same shape as w.

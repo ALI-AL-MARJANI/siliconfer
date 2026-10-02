@@ -1,4 +1,4 @@
-"""Phase 3 unit tests: GPTQ core algorithm on synthetic matrices.
+"""Unit tests: GPTQ core algorithm on synthetic matrices.
 
 No model weights are downloaded — all tests use random numpy arrays.
 
@@ -13,9 +13,8 @@ Key points on test design:
 import numpy as np
 import pytest
 
-from siliconfer.quant.primitives import fake_quantize
 from siliconfer.quant.gptq import gptq_quantize_weight
-
+from siliconfer.quant.primitives import fake_quantize
 
 # ---------------------------------------------------------------------------
 # Helpers

@@ -1,24 +1,19 @@
-"""GPTQ from scratch: Optimal Brain Quantization for LLMs.
+"""GPTQ (Frantar et al., arXiv:2210.17323).
 
-Core algorithm:
-  - Hessian H = 2 X Xᵀ  (collected by calibration.py)
-  - Dampen: H += λ·mean(diag H)·I,  λ = 0.01
-  - Compute H⁻¹ via Cholesky, then take its upper Cholesky factor U (H⁻¹ = UᵀU).
-  - Quantize columns left→right in blocks, propagating error via U (not H⁻¹ directly).
+  - Hessian H = 2 X Xᵀ (collected by calibration.py)
+  - Dampen: H += λ·mean(diag H)·I, λ = 0.01
+  - U = upper Cholesky factor of H⁻¹ (H⁻¹ = UᵀU)
+  - Quantize columns left to right in blocks, propagating the error with U
 
-WHY U not H⁻¹: U[q,q] is the conditional inverse-Hessian diagonal for column q given
-that columns 0..q-1 have been quantized (Schur complement), not the unconditional
-H⁻¹[q,q]. Using H⁻¹[q,q] directly gives wrong error-correction magnitudes.
-This matches the original GPTQ implementation (Frantar et al., 2022).
-
-Reference: Frantar et al., "GPTQ: Accurate Post-Training Quantization for
-Generative Pre-trained Transformers", ICLR 2023.
+U[q, q] is the inverse-Hessian diagonal for column q conditioned on columns
+0..q-1 being quantized (a Schur complement). H⁻¹[q, q] is the unconditional
+value and gives the wrong correction.
 """
 
 from __future__ import annotations
 
-import numpy as np
 import mlx.core as mx
+import numpy as np
 
 from siliconfer.model.llama import LlamaModel
 from siliconfer.quant.calibration import collect_layer_H
@@ -39,7 +34,8 @@ def gptq_quantize_weight(
     group_size: int = 128,
     block_size: int = 128,
     sym: bool = True,
-) -> np.ndarray:
+    return_grid: bool = False,
+) -> np.ndarray | tuple[np.ndarray, np.ndarray, np.ndarray | None]:
     """Quantize a single weight matrix using GPTQ with error feedback.
 
     Args:
@@ -51,14 +47,22 @@ def gptq_quantize_weight(
         block_size: number of columns processed per GPTQ block (typically 128).
         sym: True for symmetric int4 (zero-point = 0), False for asymmetric.
 
+        return_grid: also return the (scales, zeros) the codes were rounded on.
+            The grid is fixed from the original W before error feedback moves the
+            weights, so it cannot be re-derived from W_q afterwards: a group may
+            use code -8 or never reach ±7. Packing must use this grid (see
+            kernels/neon pack_weights_on_grid and docs/packing.md).
+
     Returns:
         W_q: float32 array, same shape as W, fake-dequantized.
+        With return_grid: (W_q, scales [out, n_groups], zeros [out, n_groups] or None).
     """
     out_features, in_features = W.shape
     if in_features < group_size:
         # Too small to group — fall back to RTN
         from siliconfer.quant.primitives import fake_quantize
-        return fake_quantize(W, group_size=in_features, sym=sym)
+        W_rtn = fake_quantize(W, group_size=in_features, sym=sym)
+        return (W_rtn, None, None) if return_grid else W_rtn
 
     # --- 1. Prepare H in float64 ---
     H = H.astype(np.float64)
@@ -149,6 +153,8 @@ def gptq_quantize_weight(
         if blk_end < in_features:
             W_q[:, blk_end:] -= errs @ U[blk_start:blk_end, blk_end:]
 
+    if return_grid:
+        return W_q.astype(np.float32), scales, (None if sym else zeros)
     return W_q.astype(np.float32)
 
 
@@ -159,8 +165,14 @@ def gptq_quantize_weight(
 def _quantize_proj(proj, H_np: np.ndarray, group_size: int, block_size: int, sym: bool) -> None:
     """Quantize a single nn.Linear weight in-place."""
     W_np = np.array(proj.weight.astype(mx.float32))
-    W_q  = gptq_quantize_weight(W_np, H_np, group_size, block_size, sym)
+    W_q, scales, zeros = gptq_quantize_weight(W_np, H_np, group_size, block_size, sym,
+                                              return_grid=True)
     proj.weight = mx.array(W_q).astype(proj.weight.dtype)
+    if scales is not None:
+        # Read by q4_loader._pack_and_replace_linears: GPTQ's codes must be
+        # packed on the grid they were rounded on, not one re-derived from W_q.
+        proj._q4_w_q = W_q
+        proj._q4_grid = (scales, zeros)
 
 
 def apply_gptq(

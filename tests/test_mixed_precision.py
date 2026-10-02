@@ -1,11 +1,7 @@
-"""Tests for mixed 2-bit/4-bit precision quantization (quant/mixed_precision.py).
+"""Tests for mixed-precision quantization (quant/mixed_precision.py).
 
-The Shapley estimator tests use synthetic value functions with a CLOSED-FORM
-ground truth (additive and pairwise-interaction games), not just "does it run"
-checks — the whole point of using Shapley values is that they're an exact,
-well-defined quantity, so the estimator should be checked against known exact
-answers wherever possible, the same way SINQ's math was checked algebraically
-before ever touching a real model.
+The Shapley estimator is checked against games with closed-form Shapley
+values (additive and pairwise-interaction).
 """
 
 from __future__ import annotations
@@ -14,20 +10,18 @@ import numpy as np
 import pytest
 
 from siliconfer.quant.mixed_precision import (
-    shapley_layer_sensitivity,
     assign_bitwidths,
+    shapley_layer_sensitivity,
 )
-
 
 # ---------------------------------------------------------------------------
 # Shapley estimator: closed-form ground truth
 # ---------------------------------------------------------------------------
 
 def test_shapley_additive_value_function_exact():
-    """For a purely additive game v(S) = sum_{i in S} c_i (no interaction
-    between players), the marginal contribution of adding player i is
-    EXACTLY c_i in every permutation, with zero variance — so even a single
-    permutation should recover c_i essentially exactly."""
+    """For an additive game v(S) = sum_{i in S} c_i the marginal contribution of
+    player i is c_i in every permutation, so one permutation recovers it.
+    """
     c = np.array([1.0, -2.5, 3.0, 0.5, -1.0])
     n = len(c)
 
@@ -39,11 +33,9 @@ def test_shapley_additive_value_function_exact():
 
 
 def test_shapley_matches_closed_form_pairwise_game():
-    """For a 2-additive game v(S) = sum_i c_i*[i in S] + sum_{i<j} d_ij*[i,j in S],
-    the exact Shapley value is phi_i = c_i + sum_{j != i} d_ij / 2 (a standard
-    result: each pairwise-interaction unanimity term splits equally between
-    its two members). Verify the Monte Carlo estimator converges to this
-    closed form."""
+    """For v(S) = sum_i c_i [i in S] + sum_{i<j} d_ij [i, j in S] the Shapley
+    value is phi_i = c_i + sum_{j != i} d_ij / 2. The estimator converges to it.
+    """
     rng = np.random.default_rng(0)
     n = 5
     c = rng.normal(0, 1, n)
@@ -156,6 +148,7 @@ def test_assign_bitwidths_only_two_values():
 
 def test_apply_mixed_precision_replaces_weights_and_forward_runs():
     import mlx.core as mx
+
     from siliconfer.model.config import ModelConfig
     from siliconfer.model.llama import LlamaModel
     from siliconfer.quant.mixed_precision import apply_mixed_precision
@@ -197,6 +190,7 @@ def test_apply_mixed_precision_2bit_blocks_lossier_than_4bit_blocks():
     assigned 4 bits, on the same underlying random init — sanity-checks that
     the bit assignment argument actually reaches the right quantizer."""
     import mlx.core as mx
+
     from siliconfer.model.config import ModelConfig
     from siliconfer.model.llama import LlamaModel
     from siliconfer.quant.mixed_precision import apply_mixed_precision
@@ -229,6 +223,7 @@ def test_apply_mixed_precision_2bit_blocks_lossier_than_4bit_blocks():
 
 def test_apply_mixed_precision_wrong_length_raises():
     import mlx.core as mx
+
     from siliconfer.model.config import ModelConfig
     from siliconfer.model.llama import LlamaModel
     from siliconfer.quant.mixed_precision import apply_mixed_precision

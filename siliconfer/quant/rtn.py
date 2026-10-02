@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-import numpy as np
 import mlx.core as mx
+import numpy as np
 
 from siliconfer.model.llama import LlamaModel
 from siliconfer.quant.primitives import fake_quantize

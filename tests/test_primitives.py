@@ -1,4 +1,4 @@
-"""Phase 2 unit tests: group-wise int4 quantization primitives.
+"""Unit tests: group-wise int4 quantization primitives.
 
 All tests run on synthetic numpy arrays — no model weights downloaded.
 """
@@ -7,23 +7,22 @@ import numpy as np
 import pytest
 
 from siliconfer.quant.primitives import (
-    quantize_sym,
-    dequantize_sym,
-    quantize_asym,
     dequantize_asym,
-    pack_int4,
-    unpack_int4,
-    quantize_sym_int2,
-    dequantize_sym_int2,
-    quantize_asym_int2,
     dequantize_asym_int2,
-    pack_int2,
-    unpack_int2,
-    quantize_sym_n,
-    quantize_asym_n,
+    dequantize_sym,
+    dequantize_sym_int2,
     fake_quantize,
+    pack_int2,
+    pack_int4,
+    quantize_asym,
+    quantize_asym_int2,
+    quantize_asym_n,
+    quantize_sym,
+    quantize_sym_int2,
+    quantize_sym_n,
+    unpack_int2,
+    unpack_int4,
 )
-
 
 # ---------------------------------------------------------------------------
 # Symmetric round-trip

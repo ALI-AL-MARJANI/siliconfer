@@ -1,16 +1,14 @@
-"""Phase 1 logit parity test: our engine vs HuggingFace reference."""
+"""Logit parity test: our engine vs HuggingFace reference."""
 
-import pytest
-pytestmark = pytest.mark.integration
-
-import numpy as np
 import mlx.core as mx
-import torch
+import numpy as np
 import pytest
+import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from siliconfer.model.llama import LlamaModel
 
+pytestmark = pytest.mark.integration
 
 MODEL_ID = "Qwen/Qwen2.5-0.5B"
 PROMPTS = [
@@ -88,7 +86,7 @@ def test_logit_parity(hf_model_and_tokenizer, our_model, prompt):
 
 def test_generation_coherence(our_model, hf_model_and_tokenizer):
     """Verify generated text is coherent (not garbage)."""
-    from siliconfer.engine.generate import generate, SamplingParams
+    from siliconfer.engine.generate import SamplingParams, generate
 
     model, config = our_model
     _, tokenizer = hf_model_and_tokenizer

@@ -5,12 +5,13 @@ tensor itself, so all tests use random numpy arrays (plus one small synthetic
 LlamaModel for the model-level integration test).
 """
 
+import mlx.core as mx
 import numpy as np
-import pytest
 
+from siliconfer.kernels.neon import pack_weights_sym
+from siliconfer.model.q4_linear import Q4Linear
 from siliconfer.quant.primitives import fake_quantize
-from siliconfer.quant.sinq import sinq_quantize_weight, apply_sinq
-
+from siliconfer.quant.sinq import apply_sinq, sinq_quantize_weight, sinq_quantize_weight_components
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -85,9 +86,8 @@ def test_sinq_beats_rtn_on_cold_columns():
 
 
 def test_sinq_beats_rtn_overall_despite_hot_column_tradeoff():
-    """Total MSE (including the hot columns, which do get worse — a real,
-    expected tradeoff, not a bug) should still improve overall when only a
-    small fraction of columns are hot."""
+    """Total MSE improves when only a small fraction of columns are hot, even
+    though the hot columns themselves get worse."""
     W, hot_col_mask = _make_column_outlier_weight(32, 128, seed=2)
 
     W_rtn = fake_quantize(W, group_size=128, sym=True)
@@ -101,13 +101,10 @@ def test_sinq_beats_rtn_overall_despite_hot_column_tradeoff():
 
 
 def test_sinq_relative_error_signal_matters():
-    """Regression guard for the real bug found during development: using
-    ABSOLUTE reconstruction error as the column-scale update signal (instead
-    of relative error) gives only a tiny improvement, because absolute error
-    is roughly uniform across columns sharing one group's quantization step
-    regardless of column magnitude. This test locks in that the *shipped*
-    algorithm (relative error) clears a bar the broken absolute-error version
-    never would."""
+    """The column-scale update must use relative error. Absolute error is
+    roughly uniform across the columns of a group, whatever their magnitude,
+    and gives only a marginal improvement; the bar here is one that an
+    absolute-error update does not reach."""
     W, hot_col_mask = _make_column_outlier_weight(32, 128, seed=3)
     cold_mask = np.tile(~hot_col_mask, (W.shape[0], 1))
 
@@ -138,6 +135,61 @@ def test_sinq_no_outlier_not_worse_than_rtn():
 
 
 # ---------------------------------------------------------------------------
+# Packed-kernel round trip — regression guard for the double-quantization bug
+# (same class of bug as AWQ's: W_eff = Q(W*s)/s is off-grid, packing it
+# directly silently re-quantizes and erases SINQ's benefit).
+# ---------------------------------------------------------------------------
+
+def test_sinq_packed_roundtrip_matches_weff():
+    """Packing SINQ's grid-aligned components through Q4Linear must reproduce
+    W_eff's output, to float32 tolerance."""
+    W, _ = _make_column_outlier_weight(32, 128, seed=31)
+
+    W_grid, s = sinq_quantize_weight_components(W, group_size=128, sym=True, n_iters=10, beta=0.5)
+    W_eff = (W_grid.astype(np.float64) / s[None, :]).astype(np.float32)
+
+    packed, scales = pack_weights_sym(W_grid, group_size=128)
+    layer = Q4Linear(packed, scales, group_size=128, input_scale=(1.0 / s).astype(np.float32))
+
+    rng = np.random.default_rng(32)
+    x_np = rng.normal(0, 1, (1, 128)).astype(np.float32)
+    y_packed = np.array(layer(mx.array(x_np)))[0]
+    y_weff = W_eff @ x_np[0]
+
+    np.testing.assert_allclose(y_packed, y_weff, atol=1e-3, rtol=1e-3)
+
+
+def test_sinq_packing_weff_directly_is_wrong():
+    """Documents the bug this fix replaces: packing W_eff directly (as the
+    code did before) diverges substantially from SINQ's intended output on
+    column-outlier data."""
+    W, _ = _make_column_outlier_weight(32, 128, seed=31)
+
+    W_grid, s = sinq_quantize_weight_components(W, group_size=128, sym=True, n_iters=10, beta=0.5)
+    W_eff = (W_grid.astype(np.float64) / s[None, :]).astype(np.float32)
+
+    packed_correct, scales_correct = pack_weights_sym(W_grid, group_size=128)
+    layer_correct = Q4Linear(packed_correct, scales_correct, group_size=128,
+                              input_scale=(1.0 / s).astype(np.float32))
+
+    packed_bad, scales_bad = pack_weights_sym(W_eff, group_size=128)  # the old, buggy path
+    layer_bad = Q4Linear(packed_bad, scales_bad, group_size=128)
+
+    rng = np.random.default_rng(32)
+    x_np = rng.normal(0, 1, (1, 128)).astype(np.float32)
+    y_ref = W_eff @ x_np[0]
+    y_correct = np.array(layer_correct(mx.array(x_np)))[0]
+    y_bad = np.array(layer_bad(mx.array(x_np)))[0]
+
+    err_correct = np.linalg.norm(y_correct - y_ref)
+    err_bad = np.linalg.norm(y_bad - y_ref)
+    assert err_bad > err_correct * 5, (
+        f"expected the naive re-pack to be much worse (err_bad={err_bad:.4f}, "
+        f"err_correct={err_correct:.4f})"
+    )
+
+
+# ---------------------------------------------------------------------------
 # Small fallback: in_features < group_size
 # ---------------------------------------------------------------------------
 
@@ -154,6 +206,7 @@ def test_sinq_small_matrix_fallback():
 
 def test_apply_sinq_replaces_weights_and_forward_runs():
     import mlx.core as mx
+
     from siliconfer.model.config import ModelConfig
     from siliconfer.model.llama import LlamaModel
 

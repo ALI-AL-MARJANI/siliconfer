@@ -1,21 +1,18 @@
-"""Phase 9c/9f unit tests: fused quantized-KV attention Metal kernel.
+"""Unit tests: fused quantized-KV attention Metal kernel.
 
 Verified against the reference "dequant int8 cache, then call
-mx.fast.scaled_dot_product_attention" path (the same one Phase 9b's
-QuantizedKVCache uses internally). As of the v3 tiled kernel (Phase 9f) this
-*does* beat native SDPA at long context (measured 1.03-1.13x from T=4096 to
-16384 — see CLAUDE.md/NOTES.md for the full v1/v2/v3 story and numbers), but
-these tests check correctness only, not throughput — performance is measured
-separately in the ad-hoc benchmark script referenced in the module docstring,
+mx.fast.scaled_dot_product_attention" path (the same one
+QuantizedKVCache uses internally). These tests check correctness only, not
+throughput — performance is measured by scripts/bench_metal_attention.py,
 since micro-benchmark timing in a unit test is flaky by nature.
 """
 
-import numpy as np
 import mlx.core as mx
+import numpy as np
 import pytest
 
 from siliconfer.kernels.metal.q4_attention import fused_quantized_attention_decode
-from siliconfer.model.kv_cache import quantize_kv, dequantize_kv
+from siliconfer.model.kv_cache import dequantize_kv, quantize_kv
 
 
 def _reference_attention(q, k_codes, k_scales, v_codes, v_scales, gqa_groups):
@@ -118,7 +115,7 @@ def test_batch_dimension():
 
 
 # ---------------------------------------------------------------------------
-# Phase 9f: explicit n_tiles — the tiled-merge mechanism itself
+# Explicit n_tiles — the tiled-merge mechanism itself
 # ---------------------------------------------------------------------------
 
 @pytest.mark.parametrize("n_tiles", [1, 2, 3, 7, 16, 64, 200])
@@ -168,7 +165,7 @@ def test_default_heuristic_picks_more_tiles_for_longer_context():
 def test_no_race_condition_with_many_tiles():
     """Same race-condition guard as before, but now specifically stressing
     the higher threadgroup counts the tiled kernel launches (this is the
-    axis that changed in Phase 9f — worth its own dedicated repeat-check)."""
+    axis that tiling changed — worth its own dedicated repeat-check)."""
     rng = np.random.default_rng(17)
     B, n_heads, n_kv_heads, head_dim, T = 1, 14, 2, 64, 2048
     q, k_codes, k_scales, v_codes, v_scales = _random_inputs(rng, B, n_heads, n_kv_heads, head_dim, T)

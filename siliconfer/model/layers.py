@@ -60,8 +60,12 @@ def apply_rope(x: mx.array, offset: int, freqs: mx.array) -> mx.array:
     T = x.shape[2]
     positions = mx.arange(offset, offset + T, dtype=mx.float32)
     angles = mx.outer(positions, freqs)
-    cos_vals = mx.cos(angles)[None, None, :, :]
-    sin_vals = mx.sin(angles)[None, None, :, :]
+    # Angles are computed in float32 for accuracy, then cast to x's dtype:
+    # leaving them float32 silently promotes q/k (and everything downstream)
+    # to float32 in an fp16 model, so every later matmul re-casts its fp16
+    # weight on every call.
+    cos_vals = mx.cos(angles)[None, None, :, :].astype(x.dtype)
+    sin_vals = mx.sin(angles)[None, None, :, :].astype(x.dtype)
 
     x1 = x[..., : x.shape[-1] // 2]
     x2 = x[..., x.shape[-1] // 2 :]

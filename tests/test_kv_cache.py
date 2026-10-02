@@ -1,21 +1,19 @@
-"""Phase 9b unit tests: group-wise int8 quantized KV cache.
+"""Unit tests: group-wise int8 quantized KV cache.
 
 No model downloads for the core tests — quantize_kv/dequantize_kv and
 QuantizedKVCache are tested directly with random mx.arrays, plus a tiny
 synthetic LlamaModel for the end-to-end generation test.
 """
 
-import numpy as np
 import mlx.core as mx
-import pytest
+import numpy as np
 
 from siliconfer.model.kv_cache import (
-    quantize_kv,
-    dequantize_kv,
     QuantizedKVCache,
+    dequantize_kv,
     make_quantized_cache,
+    quantize_kv,
 )
-
 
 # ---------------------------------------------------------------------------
 # Core quantize/dequantize round trip
@@ -173,8 +171,8 @@ def test_attention_with_quantized_cache_runs_and_matches_fp16_closely():
 
 
 def test_generate_with_quantized_kv_cache():
+    from siliconfer.engine.generate import SamplingParams, generate
     from siliconfer.model.llama import LlamaModel
-    from siliconfer.engine.generate import generate, SamplingParams
 
     config = _make_tiny_config()
     model = LlamaModel(config)
@@ -189,7 +187,7 @@ def test_generate_with_quantized_kv_cache():
 
 
 # ---------------------------------------------------------------------------
-# Analytical memory footprint (Phase 9b)
+# Analytical memory footprint
 # ---------------------------------------------------------------------------
 
 def test_measure_kv_cache_memory():

@@ -1,19 +1,20 @@
-"""Speculative decoding (Leviathan et al. 2022 / Chen et al. 2022).
+"""Speculative decoding (Leviathan et al., arXiv:2211.17192; Chen et al., arXiv:2302.01318).
 
-A small draft model proposes K tokens; the large target model verifies all K+1
-(including the anchor) in a single parallel forward pass. Accepted tokens are
-committed; the first rejection triggers resampling from the adjusted target
-distribution. The algorithm is lossless: the output distribution matches sampling
-from the target model alone.
+A draft model proposes K tokens; the target model scores all of them in one
+forward pass. Each drafted token is accepted with probability
+min(1, p_target / p_draft); the first rejection is replaced by a sample from
+the residual max(0, p_target − p_draft), and everything after it is dropped.
+The output distribution is exactly the target's. See docs/speculative.md.
 
-Expected speedup: (mean_accepted + 1) / (K * t_draft + t_target) vs 1 / t_target.
-Requires t_draft << t_target and mean_accepted ≈ K for a net win.
+A speedup needs a draft much cheaper than the target and a high acceptance
+rate: (accepted + 1) tokens cost K draft steps plus one target pass.
 """
 
 from __future__ import annotations
 
 import random
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 
 import mlx.core as mx
@@ -21,18 +22,15 @@ import mlx.core as mx
 from siliconfer.engine.generate import SamplingParams
 from siliconfer.model.kv_cache import QuantizedKVCache, make_quantized_cache
 
-
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
 def _trim_cache(cache, n: int):
-    """Return cache sliced to first n KV positions (cheap MLX view).
+    """Trim a KV cache to its first n positions.
 
-    Handles both cache representations Attention.__call__ accepts (Phase 9b):
-    plain (k, v) tuples are sliced into new arrays; QuantizedKVCache objects
-    are trimmed in place (their own .trim() mutates packed codes + scales
-    directly) and the same objects are returned.
+    Plain (k, v) tuples are sliced into new arrays; QuantizedKVCache objects are
+    trimmed in place and returned.
     """
     if cache and isinstance(cache[0], QuantizedKVCache):
         for c in cache:
@@ -86,28 +84,9 @@ def _sample_adjusted(
 
 
 
-# ---------------------------------------------------------------------------
-# Phase 9d research note: a multi-candidate "retry with a fresh draft sample"
-# scheme was attempted here and rejected after rigorous testing found it is
-# NOT lossless. The intuition ("relative winning probabilities among i.i.d.
-# retries don't depend on the number of trials") is true and easy to prove,
-# but the conclusion drawn from it was wrong: as retry count M grows, values
-# favored more by the draft model than the target model get accepted via the
-# accept-path *more* than their fair p_target share, and there is no way to
-# correct for this via an independent fallback draw — the exact fallback
-# formula that would be required works out to a NEGATIVE probability for some
-# tokens (confirmed algebraically, not just empirically: for M=2 candidates,
-# `p_target(v) - min(p_draft(v),p_target(v))*(2-Z)` goes negative whenever
-# p_draft(v) >= p_target(v) and Z is small enough). Clamping negatives to
-# zero would "fix" this into a valid distribution but makes the scheme only
-# *approximately* lossless — inconsistent with this project's standard of
-# exact, provable correctness for speculative decoding (Phase 8's algorithm
-# is verified via exact greedy token-for-token match, not just "close").
-# This is exactly why the real tree-attention literature (SpecInfer, EAGLE-2)
-# needs careful *correlated* multi-candidate verification, not naive
-# independent retries — a genuinely harder problem than this shortcut
-# assumed. See `dynamic_K` below for what Phase 9d actually ships instead.
-# ---------------------------------------------------------------------------
+# Retrying a rejected position with fresh independent draft samples is not
+# lossless: the fallback distribution it would need has negative entries.
+# See docs/speculative.md and tests/test_speculative.py.
 
 
 # ---------------------------------------------------------------------------
@@ -155,69 +134,47 @@ def speculative_generate(
     params: SamplingParams | None = None,
     K: int = 4,
     eos_token_id: int | None = None,
-    on_token: "Callable[[int], None] | None" = None,
+    on_token: Callable[[int], None] | None = None,
     seed: int | None = None,
     dynamic_K: bool = False,
     K_min: int = 1,
     K_max: int = 8,
     quantize_kv_cache: bool = False,
 ) -> SpeculativeResult:
-    """Generate tokens using speculative decoding.
+    """Generate tokens with speculative decoding.
 
     Args:
-        draft:          Small model used to propose K candidate tokens per round.
-        target:         Large model used to verify and correct.
-        prompt_ids:     [1, T] or [T] integer array (prompt token ids).
-        params:         Sampling parameters (temperature, top_p, etc.).
-        K:              Speculation depth — number of draft tokens per round.
-                        With dynamic_K=True this is only the *starting* depth.
-        eos_token_id:   Stop generation when this token is produced.
-        on_token:       Callback invoked with each accepted/sampled token id.
-        seed:           Random seed for reproducible sampling.
-        dynamic_K:      (Phase 9d) adapt K round-to-round based on the running
-                        acceptance rate — speculate deeper after rounds that
-                        accepted everything (the draft model is "in sync" with
-                        the target right now), pull back after a round rejects
-                        early (wasted draft compute). This changes only which
-                        K value each round's *already-proven-lossless*
-                        rejection-sampling algorithm uses — K never appears in
-                        that correctness proof, so this is losslessness-neutral
-                        by construction (unlike multi-candidate schemes, see
-                        the research note above `dynamic_K` docstring in the
-                        module — that approach was tried and found NOT lossless).
-        K_min, K_max:   Bounds for dynamic_K's adaptation.
-        quantize_kv_cache: (Phase 9b+9d) store both draft's and target's KV
-                        cache as group-wise int8 instead of fp16. `_trim_cache`
-                        and `Attention.__call__` already handle both cache
-                        representations transparently (Phase 9b), so this is
-                        just correctly initializing both caches with
-                        `make_quantized_cache()` instead of `None`. Note this
-                        makes speculative decoding exactly reproduce
-                        *non-speculative generation from this same
-                        quantized-cache model* (verified — see
-                        `test_speculative.py`), not the fp16-cache model's
-                        output; quantized-cache decoding is itself only
-                        approximately equal to fp16 (Phase 9b: ΔPPL ≈ +1.2).
+        draft:          model that proposes K tokens per round.
+        target:         model that verifies them.
+        prompt_ids:     [1, T] or [T] prompt token ids.
+        params:         sampling parameters.
+        K:              tokens drafted per round (the starting value when
+                        dynamic_K is set).
+        eos_token_id:   stop when this token is produced.
+        on_token:       callback invoked with each committed token id.
+        seed:           random seed.
+        dynamic_K:      raise K by one after a fully accepted round and lower it
+                        by one after a rejection. K does not appear in the
+                        accept/reject rule, so the output distribution is
+                        unchanged.
+        K_min, K_max:   bounds for dynamic_K.
+        quantize_kv_cache: keep both models' KV caches as int8. The output then
+                        matches non-speculative generation with the same
+                        quantized cache, not generation with an fp16 cache.
 
     Returns:
-        SpeculativeResult with token_ids and statistics.
+        SpeculativeResult with token ids and acceptance statistics.
 
-    Algorithm (per round):
-        1. Draft generates K tokens autoregressively from the last accepted token
-           (K itself may change round-to-round if dynamic_K=True).
-        2. Target verifies [last_accepted, d_0, ..., d_{K-1}] in one forward pass
-           (K+1 tokens), producing K+1 logit vectors.
-        3. For q = 0 .. K-1:
-               p_t = P_target(d_q)  at position q
-               p_d = P_draft(d_q)   at position q
-               Accept d_q with prob min(1, p_t / p_d).
-               If rejected: replace d_q with sample from max(0, P_target - P_draft).
-        4. If all K accepted: sample one bonus token from target_logits[:, K, :].
-        5. Output accepted tokens + the bonus/replacement token.
-        6. Trim KV caches to match the committed context length.
-        7. If dynamic_K: adjust K for the next round based on whether this
-           round accepted everything (K += 1, capped at K_max) or rejected
-           early (K -= 1, floored at K_min).
+    Per round:
+        1. The draft generates K tokens from the last committed token.
+        2. The target scores [last, d_0, ..., d_{K-1}] in one pass (K+1 logits).
+        3. For q = 0..K-1: accept d_q with probability
+           min(1, p_target(d_q) / p_draft(d_q)); on rejection, sample a
+           replacement from max(0, p_target − p_draft) and stop.
+        4. If all K were accepted, sample one more token from the target's
+           logits at position K.
+        5. Commit the accepted tokens plus the replacement or extra token, and
+           trim both KV caches to the committed length.
     """
     if params is None:
         params = SamplingParams()
