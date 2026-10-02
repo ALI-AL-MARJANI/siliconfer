@@ -1,0 +1,30 @@
+{
+  "model_id": "Qwen/Qwen2.5-0.5B",
+  "seq_len": 2048,
+  "max_tokens": null,
+  "n_tokens_used": 298938,
+  "ppl_mlx_fp32": 13.017957715181954,
+  "ppl_transformers_fp32": 13.017957447619631,
+  "abs_diff": 2.675623225201207e-07,
+  "elapsed_s": {
+    "mlx": 302.5,
+    "transformers": 238.7
+  },
+  "env": {
+    "date_utc": "2026-09-28T09:34:45.710543+00:00",
+    "git_sha": "9ee87099f7ee1ca6c154cbf99567b17402d3d36b",
+    "git_dirty": true,
+    "platform": "macOS-15.6.1-arm64-arm-64bit",
+    "python": "3.11.15",
+    "cpu": "Apple M4",
+    "memory_gb": 16.0,
+    "versions": {
+      "mlx": "0.31.2",
+      "numpy": "2.4.6",
+      "torch": "2.12.1",
+      "transformers": "5.12.1",
+      "datasets": "5.0.0",
+      "pybind11": "3.0.4"
+    }
+  }
+}

@@ -1,0 +1,159 @@
+{
+  "distribution_check": {
+    "vocab_size": 24,
+    "K": 3,
+    "n_samples": 20000,
+    "note": "token1 is sampled from the target right after prefill in every sampler; tokens 2 and 3 are the ones produced by draft-then-verify rounds",
+    "total_variation_draft_vs_target_example": 0.5699146736660623,
+    "speculative": {
+      "token1": {
+        "chi2": 21.29275982775934,
+        "df": 23,
+        "p_value": 0.5632142262152118,
+        "n": 20000
+      },
+      "token2": {
+        "chi2": 22.104222214715843,
+        "df": 23,
+        "p_value": 0.513967478643595,
+        "n": 20000
+      },
+      "token3": {
+        "chi2": 21.96820839529215,
+        "df": 23,
+        "p_value": 0.5221717562195587,
+        "n": 20000
+      },
+      "token1_token2_joint": {
+        "chi2": 305.1407586689727,
+        "df": 277,
+        "p_value": 0.11792221443756983,
+        "n": 20000
+      },
+      "draft_acceptance_rate": 0.2371901605353272
+    },
+    "speculative_dynamic_K": {
+      "token1": {
+        "chi2": 21.29275982775934,
+        "df": 23,
+        "p_value": 0.5632142262152118,
+        "n": 20000
+      },
+      "token2": {
+        "chi2": 21.533592136809773,
+        "df": 23,
+        "p_value": 0.548536483258852,
+        "n": 20000
+      },
+      "token3": {
+        "chi2": 25.632146528856737,
+        "df": 23,
+        "p_value": 0.31853655324849556,
+        "n": 20000
+      },
+      "token1_token2_joint": {
+        "chi2": 299.3678539575914,
+        "df": 277,
+        "p_value": 0.17003582331725928,
+        "n": 20000
+      },
+      "draft_acceptance_rate": 0.2563728537950165
+    },
+    "plain_sampling_control": {
+      "token1": {
+        "chi2": 21.29275982775934,
+        "df": 23,
+        "p_value": 0.5632142262152118,
+        "n": 20000
+      },
+      "token2": {
+        "chi2": 21.50714642465197,
+        "df": 23,
+        "p_value": 0.5501464517079482,
+        "n": 20000
+      },
+      "token3": {
+        "chi2": 29.422408900763934,
+        "df": 23,
+        "p_value": 0.16671033650709402,
+        "n": 20000
+      },
+      "token1_token2_joint": {
+        "chi2": 275.8375254831002,
+        "df": 277,
+        "p_value": 0.5084247551984803,
+        "n": 20000
+      },
+      "draft_acceptance_rate": null
+    }
+  },
+  "real_model": {
+    "target": "fp16",
+    "draft": "rtn int4 (same model), mlx backend",
+    "n_prompts": 10,
+    "prompt_len": 64,
+    "n_decode": 128,
+    "settings": {
+      "temperature=0.0,K=4": {
+        "acceptance_rate_mean": 0.7929533424901543,
+        "acceptance_rate_std": 0.08689734376314061,
+        "tokens_per_target_call_mean": 4.123425588706456,
+        "speculative_tok_s_mean": 64.08604411850797,
+        "speculative_tok_s_std": 4.7676928795408084,
+        "plain_target_tok_s_mean": 78.62836111476618,
+        "plain_target_tok_s_std": 1.3776777926728345,
+        "speedup": 0.8150499795483185
+      },
+      "temperature=0.0,dynamic_K": {
+        "acceptance_rate_mean": 0.8160885837712678,
+        "acceptance_rate_std": 0.049892302345415515,
+        "tokens_per_target_call_mean": 4.680906837251231,
+        "speculative_tok_s_mean": 65.52918035029126,
+        "speculative_tok_s_std": 4.321517977547774,
+        "plain_target_tok_s_mean": 78.62836111476618,
+        "plain_target_tok_s_std": 1.3776777926728345,
+        "speedup": 0.833403868797986
+      },
+      "temperature=1.0,K=4": {
+        "acceptance_rate_mean": 0.4567915469591791,
+        "acceptance_rate_std": 0.05275458520568721,
+        "tokens_per_target_call_mean": 2.805426601950872,
+        "speculative_tok_s_mean": 44.34990587937203,
+        "speculative_tok_s_std": 3.0249253740487227,
+        "plain_target_tok_s_mean": 79.50440015881838,
+        "plain_target_tok_s_std": 0.8345690310755672,
+        "speedup": 0.5578295766118408
+      },
+      "temperature=1.0,dynamic_K": {
+        "acceptance_rate_mean": 0.5168112505931767,
+        "acceptance_rate_std": 0.04507785172483333,
+        "tokens_per_target_call_mean": 2.3061303016523156,
+        "speculative_tok_s_mean": 45.19566253012968,
+        "speculative_tok_s_std": 2.8006155440919267,
+        "plain_target_tok_s_mean": 79.50440015881838,
+        "plain_target_tok_s_std": 0.8345690310755672,
+        "speedup": 0.5684674362657488
+      }
+    }
+  },
+  "elapsed_s": 551.5,
+  "env": {
+    "kernel_backend": "neon",
+    "kernel_threads": 4,
+    "date_utc": "2026-10-02T05:03:41.071277+00:00",
+    "git_sha": "9ee87099f7ee1ca6c154cbf99567b17402d3d36b",
+    "git_dirty": true,
+    "platform": "macOS-15.6.1-arm64-arm-64bit",
+    "python": "3.11.15",
+    "cpu": "Apple M4",
+    "memory_gb": 16.0,
+    "versions": {
+      "mlx": "0.31.2",
+      "numpy": "2.4.6",
+      "torch": "2.12.1",
+      "transformers": "5.12.1",
+      "datasets": "5.0.0",
+      "pybind11": "3.0.4"
+    }
+  }
+}

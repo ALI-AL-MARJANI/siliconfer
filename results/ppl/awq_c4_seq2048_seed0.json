@@ -1,0 +1,41 @@
+{
+  "model_id": "Qwen/Qwen2.5-0.5B",
+  "method": "awq",
+  "dataset": "c4",
+  "seq_len": 2048,
+  "group_size": 128,
+  "sym": true,
+  "calib_seed": 0,
+  "n_calib_seqs": 128,
+  "calib_len": 512,
+  "awq_block_loss": false,
+  "awq_clip": false,
+  "backend": "neon",
+  "max_tokens": null,
+  "c4_n_seqs": 16,
+  "c4_seed": 0,
+  "n_chunks": 16,
+  "n_tokens_scored": 32768,
+  "tokens_sha256": "e6ce5aa9759cc98c471b44e1e6896d3584471588387cfc21123e03b2cbff81b6",
+  "ppl": 24.28169541317278,
+  "elapsed_s": 171.4,
+  "env": {
+    "kernel_backend": "neon",
+    "kernel_threads": 4,
+    "date_utc": "2026-10-02T07:10:18.060409+00:00",
+    "git_sha": "9ee87099f7ee1ca6c154cbf99567b17402d3d36b",
+    "git_dirty": true,
+    "platform": "macOS-15.6.1-arm64-arm-64bit",
+    "python": "3.11.15",
+    "cpu": "Apple M4",
+    "memory_gb": 16.0,
+    "versions": {
+      "mlx": "0.31.2",
+      "numpy": "2.4.6",
+      "torch": "2.12.1",
+      "transformers": "5.12.1",
+      "datasets": "5.0.0",
+      "pybind11": "3.0.4"
+    }
+  }
+}
