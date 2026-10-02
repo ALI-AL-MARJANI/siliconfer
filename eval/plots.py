@@ -1,254 +1,221 @@
-"""Generate Phase 7 benchmark plots from a results JSON file.
+"""Generate the README figures from the raw result files.
+
+Reads results/ppl_full (falling back to results/ppl), results/bench/decode_*.json
+and results/bench/gemv.json; writes PNGs to results/figures/. Nothing is
+hard-coded: a figure whose input file is missing is skipped.
 
 Usage:
-    python eval/plots.py results.json            # saves PNGs next to the JSON
-    python eval/plots.py results.json --show     # also opens interactive windows
+    python eval/plots.py
+    python eval/plots.py --results_dir results --out_dir results/figures
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+from collections import defaultdict
 from pathlib import Path
 
 import matplotlib
-matplotlib.use("Agg")          # headless default; --show switches to interactive
+
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 
-# Consistent colours across all figures
-COLORS = {
-    "fp16":  "#4C72B0",
-    "rtn":   "#DD8452",
-    "gptq":  "#55A868",
-    "awq":   "#C44E52",
-    "hqq":   "#8172B2",
-    "sinq":  "#937860",
-}
-METHOD_LABELS = {
-    "fp16":  "fp16 (MLX)",
-    "rtn":   "RTN-int4",
-    "gptq":  "GPTQ-int4",
-    "awq":   "AWQ-int4",
-    "hqq":   "HQQ-int4",
-    "sinq":  "SINQ-int4",
-}
+# Light chart surface, ink colours, and the first two categorical slots.
+SURFACE = "#fcfcfb"
+INK = "#0b0b0b"
+INK_SECONDARY = "#52514e"
+GRID = "#e4e3df"
+SERIES_1 = "#2a78d6"     # blue
+SERIES_2 = "#eb6834"     # orange
+NEUTRAL = "#a3a29b"      # baselines / external references
+
+plt.rcParams.update({
+    "figure.facecolor": SURFACE, "axes.facecolor": SURFACE, "savefig.facecolor": SURFACE,
+    "text.color": INK, "axes.labelcolor": INK_SECONDARY, "axes.edgecolor": GRID,
+    "xtick.color": INK_SECONDARY, "ytick.color": INK, "font.size": 10,
+    "axes.titlesize": 11, "axes.titleweight": "bold", "axes.titlelocation": "left",
+    "axes.spines.top": False, "axes.spines.right": False, "axes.spines.left": False,
+    "axes.grid": True, "axes.grid.axis": "x", "grid.color": GRID, "grid.linewidth": 0.8,
+    "axes.axisbelow": True, "ytick.left": False,
+})
+
+_PPL_LABELS = [
+    (("rtn", False, False), "RTN"),
+    (("sinq", False, False), "SINQ-style"),
+    (("awq", False, False), "AWQ"),
+    (("awq", True, True), "AWQ + block loss + clip"),
+    (("hqq", False, False), "HQQ-style clip search"),
+    (("gptq", False, False), "GPTQ"),
+    (("mlx_native", False, False), "MLX mx.quantize (reference)"),
+]
 
 
-def _savefig(fig, path: Path, show: bool) -> None:
-    fig.tight_layout()
-    fig.savefig(path, dpi=150, bbox_inches="tight")
-    print(f"  saved → {path}")
-    if show:
-        plt.show()
+def _load(path: Path) -> dict | None:
+    try:
+        return json.loads(path.read_text())
+    except (FileNotFoundError, json.JSONDecodeError):
+        return None
+
+
+def _save(fig, path: Path) -> None:
+    fig.savefig(path, dpi=160, bbox_inches="tight")
     plt.close(fig)
+    print(f"  saved {path}")
 
 
 # ---------------------------------------------------------------------------
-# 1. PPL bar chart
+# 1. Perplexity increase over fp16, per method, symmetric vs asymmetric grid
 # ---------------------------------------------------------------------------
 
-def plot_ppl(results: dict, out_dir: Path, show: bool) -> None:
-    ppl_data = {k: v["ppl"] for k, v in results.items() if "ppl" in v}
-    if not ppl_data:
-        print("  [skip] no PPL data in results")
+def plot_ppl(ppl_dir: Path, out_dir: Path) -> None:
+    runs: dict = defaultdict(lambda: defaultdict(list))
+    for path in sorted(ppl_dir.glob("*.json")):
+        r = _load(path)
+        if not r or "method" not in r or r.get("group_size", 128) != 128:
+            continue
+        m = r["method"]
+        grid = "asym" if m in ("hqq", "mlx_native") or not r.get("sym", True) else "sym"
+        runs[(m, bool(r.get("awq_block_loss")), bool(r.get("awq_clip")), grid)][r["dataset"]].append(r["ppl"])
+    fp16 = {d: v[0] for d, v in runs.get(("fp16", False, False, "sym"), {}).items()}
+    if not fp16:
+        print("  ppl: no fp16 result, skipped")
         return
 
-    methods = list(ppl_data.keys())
-    ppls    = [ppl_data[m] for m in methods]
-    ref_ppl = ppl_data.get("fp16", ppls[0])
-    labels  = [METHOD_LABELS.get(m, m) for m in methods]
-    colors  = [COLORS.get(m, "#999") for m in methods]
-
-    fig, ax = plt.subplots(figsize=(7, 4))
-    bars = ax.bar(labels, ppls, color=colors, width=0.5, edgecolor="white", linewidth=0.8)
-
-    # Annotate bars with PPL value + Δ
-    for bar, m, ppl in zip(bars, methods, ppls):
-        delta = ppl - ref_ppl
-        sign  = "+" if delta >= 0 else ""
-        tag   = f"{ppl:.2f}" if m == "fp16" else f"{ppl:.2f}\n({sign}{delta:.2f})"
-        ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.3,
-                tag, ha="center", va="bottom", fontsize=9)
-
-    ax.set_ylabel("WikiText-2 Perplexity (↓ lower is better)")
-    ax.set_title("Quantization PPL: Qwen2.5-0.5B")
-    ax.set_ylim(0, max(ppls) * 1.25)
-    ax.spines[["top", "right"]].set_visible(False)
-    _savefig(fig, out_dir / "ppl.png", show)
+    datasets = [d for d in ("wikitext2", "c4") if d in fp16]
+    titles = {"wikitext2": "WikiText-2 test", "c4": "C4 validation subset"}
+    fig, axes = plt.subplots(1, len(datasets), figsize=(5.4 * len(datasets), 4.2), sharey=True)
+    axes = np.atleast_1d(axes)
+    h = 0.36
+    for ax, d in zip(axes, datasets):
+        for i, (key, _) in enumerate(_PPL_LABELS):
+            for grid, offset, color in (("sym", -h / 2 - 0.01, SERIES_1), ("asym", h / 2 + 0.01, SERIES_2)):
+                v = runs.get((*key, grid), {}).get(d)
+                if not v:
+                    continue
+                delta = np.mean(v) - fp16[d]
+                err = np.std(v, ddof=1) if len(v) > 1 else None
+                ax.barh(i + offset, delta, height=h, color=color, xerr=err,
+                        error_kw=dict(ecolor=INK, elinewidth=1, capsize=2))
+                ax.text(delta + (err or 0) + 0.05, i + offset, f"+{delta:.2f}", va="center",
+                        fontsize=8.5, color=INK)
+        ax.set_title(f"{titles[d]}  (fp16 = {fp16[d]:.2f})")
+        ax.set_xlabel("perplexity increase over fp16 (lower is better)")
+        ax.set_yticks(range(len(_PPL_LABELS)), [label for _, label in _PPL_LABELS])
+        ax.set_xlim(left=0)
+        ax.margins(x=0.16)
+    axes[0].invert_yaxis()               # y is shared: invert once
+    handles = [plt.Rectangle((0, 0), 1, 1, color=SERIES_1), plt.Rectangle((0, 0), 1, 1, color=SERIES_2)]
+    fig.legend(handles, ["symmetric grid", "asymmetric grid"], loc="lower center", ncol=2,
+               frameon=False, bbox_to_anchor=(0.5, -0.06))
+    fig.suptitle("int4 perplexity cost by method — Qwen2.5-0.5B, group size 128, context 2048",
+                 x=0.01, ha="left", fontsize=12, fontweight="bold")
+    fig.tight_layout()
+    _save(fig, out_dir / "ppl.png")
 
 
 # ---------------------------------------------------------------------------
-# 2. Decode throughput
+# 2. Decode throughput, this repo's configurations and the mlx-lm reference
 # ---------------------------------------------------------------------------
 
-def plot_throughput(results: dict, out_dir: Path, show: bool) -> None:
-    tput_data = {k: v["decode_tok_s"] for k, v in results.items() if "decode_tok_s" in v}
-    if not tput_data:
-        print("  [skip] no throughput data in results")
+def plot_decode(bench_dir: Path, out_dir: Path) -> None:
+    files = sorted(p for p in bench_dir.glob("decode_*.json") if "mlx_lm_reference" not in p.name)
+    if not files:
+        print("  decode: no result, skipped")
         return
+    r = _load(files[0])
+    ref = _load(bench_dir / files[0].name.replace("decode_", "decode_mlx_lm_reference_"))
+    prompt = sorted(next(iter(r["configs"].values()))["prompts"], key=int)[0]
 
-    methods = list(tput_data.keys())
-    tputs   = [tput_data[m] for m in methods]
-    labels  = [METHOD_LABELS.get(m, m) for m in methods]
-    colors  = [COLORS.get(m, "#999") for m in methods]
-    ref_tput = tput_data.get("fp16", tputs[0])
+    labels = {"fp16": "fp16 (MLX, GPU)", "int4-neon": "int4, NEON kernel (CPU)",
+              "int4-mlx": "int4, MLX quantized matmul (GPU)",
+              "mlx_lm-bf16": "mlx-lm, bf16", "mlx_lm-4bit": "mlx-lm, 4-bit"}
+    rows = [(labels.get(n, n), e["prompts"][prompt]["decode_tok_s"], SERIES_1)
+            for n, e in r["configs"].items()]
+    if ref:
+        rows += [(labels.get(n, n), e["prompts"][prompt]["decode_tok_s"], NEUTRAL)
+                 for n, e in ref["configs"].items()]
 
-    fig, ax = plt.subplots(figsize=(7, 4))
-    bars = ax.bar(labels, tputs, color=colors, width=0.5, edgecolor="white", linewidth=0.8)
-
-    for bar, m, t in zip(bars, methods, tputs):
-        speedup = t / ref_tput if ref_tput > 0 else 1.0
-        tag = f"{t:.1f}" if m == "fp16" else f"{t:.1f}\n({speedup:.2f}×)"
-        ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.3,
-                tag, ha="center", va="bottom", fontsize=9)
-
-    ax.set_ylabel("Decode throughput (tok/s ↑)")
-    ax.set_title("Decode Speed: Qwen2.5-0.5B, batch=1")
-    ax.set_ylim(0, max(tputs) * 1.3)
-    ax.spines[["top", "right"]].set_visible(False)
-    _savefig(fig, out_dir / "throughput.png", show)
+    fig, ax = plt.subplots(figsize=(7.2, 0.5 * len(rows) + 1.6))
+    for i, (_, d, color) in enumerate(rows):
+        ax.barh(i, d["p50"], height=0.5, color=color,
+                xerr=[[d["p50"] - d["p10"]], [d["p90"] - d["p50"]]],
+                error_kw=dict(ecolor=INK, elinewidth=1, capsize=2))
+        ax.text(d["p90"] + 2, i, f"{d['p50']:.0f}", va="center", fontsize=9, color=INK)
+    ax.set_yticks(range(len(rows)), [label for label, _, _ in rows])
+    ax.invert_yaxis()
+    ax.set_xlim(left=0)
+    ax.margins(x=0.1)
+    ax.set_xlabel("decode tokens per second, p50 with p10–p90 (higher is better)")
+    ax.set_title(f"Decode speed — {r['model_id'].split('/')[-1]}, {prompt}-token prompt, greedy")
+    if ref:
+        handles = [plt.Rectangle((0, 0), 1, 1, color=SERIES_1), plt.Rectangle((0, 0), 1, 1, color=NEUTRAL)]
+        fig.legend(handles, ["this repo", "external reference (mlx-lm)"], frameon=False,
+                   loc="lower center", ncol=2, bbox_to_anchor=(0.5, -0.07))
+    fig.tight_layout()
+    _save(fig, out_dir / "decode.png")
 
 
 # ---------------------------------------------------------------------------
-# 3. Memory footprint
+# 3. GEMV micro-benchmark, one panel per matrix shape
 # ---------------------------------------------------------------------------
 
-def plot_memory(results: dict, out_dir: Path, show: bool) -> None:
-    mem_data = {k: v["total_mb"] for k, v in results.items() if "total_mb" in v}
-    if not mem_data:
-        print("  [skip] no memory data in results")
+def plot_gemv(bench_dir: Path, out_dir: Path) -> None:
+    r = _load(bench_dir / "gemv.json")
+    if not r:
+        print("  gemv: no result, skipped")
         return
+    labels = {"neon_q4_1t": "NEON int4, 1 thread", "neon_q4_mt": "NEON int4, threaded",
+              "accelerate_fp32": "Accelerate fp32", "numpy_fp16": "NumPy fp16 (old baseline)",
+              "mlx_fp16": "MLX fp16 (GPU)", "mlx_fp32": "MLX fp32 (GPU)", "mlx_q4": "MLX 4-bit (GPU)"}
+    shapes = r["shapes"]
+    cols = 3
+    rows_n = -(-len(shapes) // cols)
+    fig, axes = plt.subplots(rows_n, cols, figsize=(4.6 * cols, 2.9 * rows_n), sharey=True)
+    axes = np.atleast_2d(axes)
+    names = list(shapes[0]["contenders"])
+    for ax, s in zip(axes.ravel(), shapes):
+        for i, n in enumerate(names):
+            ms = s["contenders"][n]["cold"]["p50_ms"]
+            ax.barh(i, ms, height=0.55, color=SERIES_1 if n.startswith("neon") else NEUTRAL)
+            ax.text(ms, i, f" {ms:.3f}", va="center", fontsize=8, color=INK)
+        ax.set_title(f"{s['out_f']} × {s['in_f']}")
+        ax.set_yticks(range(len(names)), [labels.get(n, n) for n in names])
+        ax.set_xlim(left=0)
+        ax.margins(x=0.22)
+    axes[0, 0].invert_yaxis()            # y is shared: invert once
+    for ax in axes.ravel()[len(shapes):]:
+        ax.set_visible(False)
+    for ax in axes[-1]:
+        ax.set_xlabel("ms per product, cold cache, p50 (lower is better)")
+    handles = [plt.Rectangle((0, 0), 1, 1, color=SERIES_1), plt.Rectangle((0, 0), 1, 1, color=NEUTRAL)]
+    fig.legend(handles, ["this repo's kernel", "baselines"], loc="lower center", ncol=2,
+               frameon=False, bbox_to_anchor=(0.5, -0.04))
+    fig.suptitle("One matrix-vector product (out × in), Apple M4", x=0.01, ha="left",
+                 fontsize=12, fontweight="bold")
+    fig.tight_layout()
+    _save(fig, out_dir / "gemv.png")
 
-    methods = list(mem_data.keys())
-    mbs     = [mem_data[m] for m in methods]
-    labels  = [METHOD_LABELS.get(m, m) for m in methods]
-    colors  = [COLORS.get(m, "#999") for m in methods]
-    ref_mb  = mem_data.get("fp16", mbs[0])
-
-    fig, ax = plt.subplots(figsize=(7, 4))
-    bars = ax.bar(labels, [m / 1000 for m in mbs], color=colors,
-                  width=0.5, edgecolor="white", linewidth=0.8)
-
-    for bar, m, mb in zip(bars, methods, mbs):
-        ratio = ref_mb / mb if mb > 0 else 1.0
-        tag = f"{mb/1000:.2f} GB" if m == "fp16" else f"{mb/1000:.2f} GB\n({ratio:.1f}× less)"
-        ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.005,
-                tag, ha="center", va="bottom", fontsize=9)
-
-    ax.set_ylabel("Weight memory (GB)")
-    ax.set_title("Weight Footprint: Qwen2.5-0.5B projection layers")
-    ax.set_ylim(0, max(m / 1000 for m in mbs) * 1.3)
-    ax.spines[["top", "right"]].set_visible(False)
-    _savefig(fig, out_dir / "memory.png", show)
-
-
-# ---------------------------------------------------------------------------
-# 4. Roofline diagram
-# ---------------------------------------------------------------------------
-
-def plot_roofline(results: dict, out_dir: Path, show: bool, m4_bw_gbs: float = 120.0) -> None:
-    """Arithmetic-intensity roofline for the decode GEMV kernel."""
-    fig, ax = plt.subplots(figsize=(7, 5))
-
-    # Roofline ceiling: bandwidth bound (straight line)
-    ai_range = np.logspace(-3, 2, 400)        # FLOP/byte
-    roof_bw  = m4_bw_gbs * ai_range           # GFLOP/s = BW(GB/s) × AI(FLOP/B)
-    ax.loglog(ai_range, roof_bw, "k--", lw=1.5, label=f"M4 bandwidth ceiling ({m4_bw_gbs:.0f} GB/s)")
-
-    # Our kernel operating points from results (if present)
-    if "neon_bw_gbs" in results.get("kernel", {}):
-        k = results["kernel"]
-        bw    = k["neon_bw_gbs"]        # GB/s achieved
-        ai_q4 = k.get("ai_q4", 0.25)   # typical: 0.5 FLOP / 0.5 byte = 1, but
-                                         # with cache effects often lower
-        perf  = bw * ai_q4
-        ax.scatter([ai_q4], [perf], s=120, color=COLORS["rtn"], zorder=5,
-                   label=f"NEON q4 kernel ({bw:.1f} GB/s achieved)")
-
-    # Annotate typical regions
-    ax.axvline(1.0, color="#aaa", lw=0.8, linestyle=":")
-    ax.text(1.1, 0.5, "compute\nbound →", fontsize=8, color="#666", va="center")
-    ax.text(0.9, 0.5, "← memory\nbound", fontsize=8, color="#666", va="center", ha="right")
-
-    ax.set_xlabel("Arithmetic Intensity (FLOP / byte)")
-    ax.set_ylabel("Throughput (GFLOP/s)")
-    ax.set_title("Roofline: M4 Base, decode GEMV")
-    ax.legend(loc="upper left", fontsize=9)
-    ax.spines[["top", "right"]].set_visible(False)
-    _savefig(fig, out_dir / "roofline.png", show)
-
-
-# ---------------------------------------------------------------------------
-# 5. Summary table (text, always printed)
-# ---------------------------------------------------------------------------
-
-def print_table(results: dict) -> None:
-    methods = list(results.keys())
-    if "kernel" in methods:
-        methods.remove("kernel")
-
-    ref = results.get("fp16", {})
-    ref_ppl  = ref.get("ppl", None)
-    ref_tput = ref.get("decode_tok_s", None)
-    ref_mem  = ref.get("total_mb", None)
-
-    print("\n" + "=" * 82)
-    print(f"{'Method':<18} {'bits':>4} {'PPL':>8} {'ΔPPL':>7} "
-          f"{'decode tok/s':>13} {'speedup':>9} {'mem MB':>8} {'compression':>12}")
-    print("-" * 82)
-
-    for m in methods:
-        v = results[m]
-        bits     = 4 if m != "fp16" else 16
-        ppl      = v.get("ppl")
-        tput     = v.get("decode_tok_s")
-        mem      = v.get("total_mb")
-
-        ppl_str  = f"{ppl:.2f}"  if ppl  is not None else "—"
-        dppl_str = (f"+{ppl-ref_ppl:.2f}" if ref_ppl and ppl and m != "fp16"
-                    else ("—" if m == "fp16" else "?"))
-        tput_str = f"{tput:.1f}"  if tput is not None else "—"
-        spd_str  = (f"{tput/ref_tput:.2f}×" if ref_tput and tput else "—")
-        mem_str  = f"{mem:.0f}"  if mem  is not None else "—"
-        comp_str = (f"{ref_mem/mem:.1f}×" if ref_mem and mem and m != "fp16"
-                    else ("—" if m == "fp16" else "?"))
-
-        print(f"{METHOD_LABELS.get(m, m):<18} {bits:>4} {ppl_str:>8} {dppl_str:>7} "
-              f"{tput_str:>13} {spd_str:>9} {mem_str:>8} {comp_str:>12}")
-
-    print("=" * 82 + "\n")
-
-
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
 
 def main() -> None:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("results_json", help="Path to results JSON file.")
-    parser.add_argument("--show", action="store_true", help="Open interactive plot windows.")
-    parser.add_argument("--out_dir", default=None,
-                        help="Output directory for PNGs (default: same as results_json).")
+    parser = argparse.ArgumentParser(description=__doc__,
+                                     formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--results_dir", default="results")
+    parser.add_argument("--out_dir", default=None)
     args = parser.parse_args()
 
-    results_path = Path(args.results_json)
-    with open(results_path) as f:
-        results = json.load(f)
-
-    out_dir = Path(args.out_dir) if args.out_dir else results_path.parent
+    root = Path(args.results_dir)
+    out_dir = Path(args.out_dir) if args.out_dir else root / "figures"
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    if args.show:
-        matplotlib.use("TkAgg")
-
-    print_table(results)
-    print(f"Generating plots in {out_dir} ...")
-    plot_ppl(results, out_dir, args.show)
-    plot_throughput(results, out_dir, args.show)
-    plot_memory(results, out_dir, args.show)
-    plot_roofline(results, out_dir, args.show)
-    print("Done.")
+    ppl_dir = root / "ppl_full"
+    if not any(ppl_dir.glob("fp16_*.json")):
+        ppl_dir = root / "ppl"
+    print(f"Figures from {root}/ (perplexity: {ppl_dir})")
+    plot_ppl(ppl_dir, out_dir)
+    plot_decode(root / "bench", out_dir)
+    plot_gemv(root / "bench", out_dir)
 
 
 if __name__ == "__main__":

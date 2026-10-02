@@ -14,23 +14,23 @@ from __future__ import annotations
 import argparse
 import time
 
-import numpy as np
 import mlx.core as mx
+import numpy as np
 
+from siliconfer.eval.perplexity import compute_perplexity
 from siliconfer.model.llama import LlamaModel
-from siliconfer.quant.rtn import apply_rtn
+from siliconfer.quant.awq import apply_awq
 from siliconfer.quant.calibration import load_calibration_sequences
 from siliconfer.quant.gptq import apply_gptq
-from siliconfer.quant.awq import apply_awq
 from siliconfer.quant.hqq import apply_hqq
-from siliconfer.quant.sinq import apply_sinq
 from siliconfer.quant.mixed_precision import (
-    shapley_layer_sensitivity,
+    apply_mixed_precision,
     assign_bitwidths,
     make_block_nll_value_fn,
-    apply_mixed_precision,
+    shapley_layer_sensitivity,
 )
-from siliconfer.eval.perplexity import compute_perplexity
+from siliconfer.quant.rtn import apply_rtn
+from siliconfer.quant.sinq import apply_sinq
 
 
 def _resolve_model_dir(model_id: str, model_dir: str | None) -> str:
@@ -68,8 +68,10 @@ def main() -> None:
     parser.add_argument("--mixed_low_bits", type=int, default=2,
                         help="Bit-width for demoted blocks in --method mixed (default: 2). "
                              "3 was found to meaningfully close the gap to uniform HQQ-int4 "
-                             "vs plain 2-bit — see NOTES.md.")
+                             "vs plain 2-bit.")
     parser.add_argument("--group_size", type=int, default=128)
+    parser.add_argument("--results_json", default=None,
+                        help="Write the PPL table (plus config and environment) to this JSON file.")
     parser.add_argument("--asym", action="store_true",
                         help="Use asymmetric quantization (default: symmetric).")
     parser.add_argument("--seq_len", type=int, default=2048)
@@ -271,6 +273,21 @@ def main() -> None:
         delta = f"+{ppl - ref_ppl:.2f}" if ppl != ref_ppl else "—"
         print(f"{name:<34} {ppl:>8.2f} {delta:>8}")
     print("=" * 55)
+
+    if args.results_json:
+        import json
+        from pathlib import Path
+
+        from siliconfer.eval.env_info import collect_env_info
+        out_path = Path(args.results_json)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_text(json.dumps({
+            "note": "algorithm-level (fake-quant) evaluation through the fp16 forward pass",
+            "config": vars(args),
+            "ppl": {name: ppl for name, ppl in results},
+            "env": collect_env_info(),
+        }, indent=2))
+        print(f"wrote {out_path}")
 
 
 if __name__ == "__main__":
